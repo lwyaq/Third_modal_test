@@ -114,7 +114,9 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
         if init.shape[1] == hidden_dim:
             prototypes = init
         else:
-            projection = torch.randn(init.shape[1], hidden_dim) / (init.shape[1] ** 0.5)
+            projection = torch.randn(
+                init.shape[1], hidden_dim, device=init.device, dtype=init.dtype
+            ) / (init.shape[1] ** 0.5)
             prototypes = init @ projection
         self.edge_features = nn.Parameter(prototypes)
         self.query = nn.Linear(hidden_dim, hidden_dim)
