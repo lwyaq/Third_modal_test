@@ -42,6 +42,16 @@ def parse_args():
     p.add_argument("--n_feature_edges", type=int, default=60)
     p.add_argument("--k_nodes", type=int, default=15)
     p.add_argument("--k_edges", type=int, default=8)
+    p.add_argument("--use_hsl_spatial", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--use_dynamic_feature", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--edge_adjust_interval", type=int, default=10)
+    p.add_argument("--delta_edges", type=int, default=20)
+    p.add_argument("--beta_saturation", type=float, default=0.90)
+    p.add_argument("--gamma_saturation", type=float, default=0.98)
+    p.add_argument("--topk_edges", type=int, default=3)
+    p.add_argument("--min_edges", type=int, default=100)
+    p.add_argument("--hsl_residual_strength", type=float, default=0.5)
+    p.add_argument("--allow_edge_add", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--dropout", type=float, default=0.3)
 
     p.add_argument("--lr", type=float, default=0.001)
@@ -142,6 +152,17 @@ def main():
         lambda_cluster=args.lambda_cluster,
         lambda_smooth=args.lambda_smooth,
         max_spatial_edges=args.max_spatial_edges,
+        use_hsl_spatial=args.use_hsl_spatial,
+        use_dynamic_feature=args.use_dynamic_feature,
+        edge_adjust_interval=args.edge_adjust_interval,
+        delta_edges=args.delta_edges,
+        beta_saturation=args.beta_saturation,
+        gamma_saturation=args.gamma_saturation,
+        topk_edges=args.topk_edges,
+        min_edges=args.min_edges,
+        max_edges=coords.shape[0],
+        hsl_residual_strength=args.hsl_residual_strength,
+        allow_edge_add=args.allow_edge_add,
     )
 
     metrics = trainer.fit()

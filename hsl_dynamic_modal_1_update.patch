@@ -1,0 +1,791 @@
+diff --git a/modal_1/README.md b/modal_1/README.md
+new file mode 100644
+index 0000000..88f2e93
+--- /dev/null
++++ b/modal_1/README.md
+@@ -0,0 +1,162 @@
++# HSL-DvDHGNN (`modal_1`)
++
++This folder contains the current unsupervised spatial multi-omics model implementation.
++The model is designed for paired RNA/ATAC features and spatial coordinates without
++concatenating the two omics inputs before the model.
++
++## Current model flow
++
++```text
++RNA features X_RNA          ATAC features X_ATAC          spatial coordinates C
++        |                            |                              |
++        v                            v                              v
++  Encoder_RNA                  Encoder_ATAC              Delaunay-star H_spatial^0
++        |                            |                              |
++        +------------+---------------+------------------------------+
++                     |
++                     v
++        Per-modality dual-branch hypergraph learning
++
++For each modality m in {RNA, ATAC}:
++  1. Spatial branch:
++     - Use the fixed Delaunay-star spatial topology.
++     - Apply HSLSpatialRefiner to learn incidence weights only.
++     - Do not add or remove spatial hyperedges.
++
++  2. Feature branch:
++     - Initialize dynamic feature hyperedge prototypes from that modality's
++       biological feature distribution.
++     - Build a dynamic feature hypergraph with top-k node-to-hyperedge attention.
++     - Optionally adjust feature hyperedge count using saturation-guided pruning
++       and expansion.
++
++  3. Intra-modal fusion:
++     Z_m = sigmoid(alpha_m) * Z_m_spatial + (1 - sigmoid(alpha_m)) * Z_m_feature
++
++Cross-modal fusion:
++  Z = sigmoid(beta) * Z_RNA + (1 - sigmoid(beta)) * Z_ATAC
++
++Unsupervised optimization:
++  reconstruction loss + DEC cluster loss + spatial/feature smoothness loss
++```
++
++## Important implementation details
++
++### No RNA/ATAC input concatenation
++
++The trainer keeps RNA and ATAC features as a list of per-modality arrays. During
++training, the model receives a list of tensors:
++
++```python
++[RNA_tensor, ATAC_tensor]
++```
++
++`DualBranchDHGNN.forward()` raises an error if a concatenated tensor is passed.
++This is intentional: each modality must be encoded independently.
++
++### HSL spatial refinement
++
++`HSLSpatialRefiner` refines only the incidence values of the fixed spatial
++hypergraph:
++
++```text
++H_spatial_refined = H_spatial^0 ⊙ G_theta(Z_m)
++```
++
++The spatial topology is not reconstructed during training.
++
++### Dynamic biological feature hypergraphs
++
++`VariableBioDynamicFeatureHypergraph` initializes feature hyperedge prototypes
++from the corresponding modality features. If the modality feature dimension does
++not match `hidden_dim`, a one-time projection is used only to align dimensions.
++The hyperedge prototypes are still derived from the real RNA/ATAC feature
++distribution, not from random Gaussian hyperedges.
++
++### Unsupervised objective
++
++The current loss is unsupervised:
++
++```text
++L = lambda_recon * L_recon
++  + lambda_cluster * L_DEC
++  + lambda_smooth * (L_smooth_spatial + L_smooth_feature)
++```
++
++There is no supervised or semi-supervised classifier loss.
++
++### Early stopping
++
++Model selection and early stopping use total training loss improvement, not ARI.
++ARI/NMI are only reported when labels are available.
++
++## Running experiment variants
++
++Run commands from the repository root.
++
++### Version 1: HSL spatial + static feature hypergraph
++
++```bash
++python -m modal_1.run \
++  --use_hsl_spatial \
++  --no-use_dynamic_feature
++```
++
++### Version 2: HSL spatial + dynamic feature hypergraph with fixed edge count
++
++```bash
++python -m modal_1.run \
++  --use_hsl_spatial \
++  --use_dynamic_feature \
++  --edge_adjust_interval 0
++```
++
++### Version 3: HSL spatial + dynamic feature hypergraph with pruning only
++
++```bash
++python -m modal_1.run \
++  --use_hsl_spatial \
++  --use_dynamic_feature \
++  --edge_adjust_interval 10 \
++  --delta_edges 20 \
++  --beta_saturation 0.90 \
++  --gamma_saturation 0.98 \
++  --no-allow_edge_add
++```
++
++### Version 4: HSL spatial + dynamic feature hypergraph with add/prune
++
++```bash
++python -m modal_1.run \
++  --use_hsl_spatial \
++  --use_dynamic_feature \
++  --edge_adjust_interval 10 \
++  --delta_edges 20 \
++  --beta_saturation 0.90 \
++  --gamma_saturation 0.98 \
++  --allow_edge_add
++```
++
++## Key CLI arguments
++
++| Argument | Meaning |
++| --- | --- |
++| `--use_hsl_spatial` / `--no-use_hsl_spatial` | Enable/disable HSL refinement of spatial incidence weights. |
++| `--use_dynamic_feature` / `--no-use_dynamic_feature` | Enable/disable dynamic biological feature hypergraphs. |
++| `--edge_adjust_interval` | Epoch interval for feature hyperedge count adjustment; use `0` for fixed M. |
++| `--delta_edges` | Number of feature hyperedges to add/prune at each adjustment. |
++| `--beta_saturation` | Prune threshold. If saturation is below this value, redundant edges are removed. |
++| `--gamma_saturation` | Add threshold. If saturation is above this value, capacity can be expanded. |
++| `--topk_edges` | Number of feature hyperedges each node connects to during dynamic construction. |
++| `--min_edges` | Minimum number of feature hyperedges after pruning. |
++| `--allow_edge_add` / `--no-allow_edge_add` | Allow or forbid feature hyperedge expansion. |
++| `--hsl_residual_strength` | Residual strength for HSL incidence refinement. |
++
++## Notes
++
++- Dynamic feature hypergraphs are currently modality-level, not layer-level, to
++  keep computation manageable.
++- Spatial topology is always built outside the network and remains fixed during
++  training; HSL only changes the weights.
++- If `use_dynamic_feature=True`, static feature hypergraph construction is
++  skipped and feature hypergraphs are generated inside the model during forward.
+diff --git a/modal_1/networks.py b/modal_1/networks.py
+index e661964..fbbc088 100644
+--- a/modal_1/networks.py
++++ b/modal_1/networks.py
+@@ -67,6 +67,110 @@ class SparseHGNNConv(nn.Module):
+         return x_out
+ 
+ 
++class HSLSpatialRefiner(nn.Module):
++    """Learn incidence weights on a fixed spatial hypergraph topology."""
++
++    def __init__(self, hidden_dim: int, residual_strength: float = 0.5):
++        super().__init__()
++        self.residual_strength = residual_strength
++        self.edge_gate = nn.Sequential(
++            nn.Linear(hidden_dim * 2, hidden_dim),
++            nn.GELU(),
++            nn.Linear(hidden_dim, 1),
++        )
++        nn.init.zeros_(self.edge_gate[-1].weight)
++        nn.init.zeros_(self.edge_gate[-1].bias)
++        self.last_stats: Dict[str, float] = {}
++
++    def forward(self, h_s, sp_rows, sp_cols, sp_vals, n_nodes, n_spatial_edges):
++        De = torch.zeros(n_spatial_edges, device=h_s.device)
++        De.scatter_add_(0, sp_cols, sp_vals)
++        De = De.clamp(min=1.0)
++        weighted_nodes = h_s[sp_rows] * sp_vals.unsqueeze(1)
++        edge_feats = torch.zeros(n_spatial_edges, h_s.shape[1], device=h_s.device)
++        edge_feats.scatter_add_(0, sp_cols.unsqueeze(1).expand_as(weighted_nodes), weighted_nodes)
++        edge_feats = edge_feats / De.unsqueeze(1)
++
++        logits = self.edge_gate(torch.cat([h_s[sp_rows], edge_feats[sp_cols]], dim=1)).squeeze(-1)
++        learned = 2.0 * torch.sigmoid(logits)
++        scale = (1.0 - self.residual_strength) + self.residual_strength * learned
++        refined = sp_vals * scale.clamp(0.1, 2.0)
++        with torch.no_grad():
++            self.last_stats = {
++                "min": float(refined.min().detach().cpu()),
++                "max": float(refined.max().detach().cpu()),
++                "mean": float(refined.mean().detach().cpu()),
++            }
++        return refined
++
++
++class VariableBioDynamicFeatureHypergraph(nn.Module):
++    """Biologically initialized dynamic feature hypergraph with variable edge count."""
++
++    def __init__(self, init_node_features, hidden_dim: int, topk_edges: int = 3,
++                 min_edges: int = 100, max_edges: Optional[int] = None):
++        super().__init__()
++        init = torch.as_tensor(init_node_features, dtype=torch.float32).detach().clone()
++        if init.shape[1] == hidden_dim:
++            prototypes = init
++        else:
++            projection = torch.randn(init.shape[1], hidden_dim) / (init.shape[1] ** 0.5)
++            prototypes = init @ projection
++        self.edge_features = nn.Parameter(prototypes)
++        self.query = nn.Linear(hidden_dim, hidden_dim)
++        self.key = nn.Linear(hidden_dim, hidden_dim)
++        self.topk_edges = topk_edges
++        self.min_edges = min_edges
++        self.max_edges = max_edges or init.shape[0]
++        self.last_edge_usage: Optional[torch.Tensor] = None
++        self.last_saturation = 0.0
++
++    @property
++    def n_edges(self) -> int:
++        return int(self.edge_features.shape[0])
++
++    def forward(self, node_embeddings):
++        n_nodes = node_embeddings.shape[0]
++        n_edges = self.n_edges
++        k = min(self.topk_edges, n_edges)
++        scores = self.query(node_embeddings) @ self.key(self.edge_features).T
++        scores = scores / (node_embeddings.shape[1] ** 0.5)
++        attn = torch.softmax(scores, dim=1)
++        vals, cols = torch.topk(attn, k=k, dim=1)
++        rows = torch.arange(n_nodes, device=node_embeddings.device).repeat_interleave(k)
++        cols = cols.reshape(-1)
++        vals = vals.reshape(-1)
++        usage = torch.bincount(cols.detach(), minlength=n_edges).to(node_embeddings.device)
++        self.last_edge_usage = usage
++        self.last_saturation = float((usage > 0).float().mean().detach().cpu())
++        return rows, cols, vals, n_edges
++
++    @torch.no_grad()
++    def adjust_edges(self, beta=0.90, gamma=0.98, delta_edges=20, allow_add=True):
++        device = self.edge_features.device
++        usage = self.last_edge_usage
++        n_edges = self.n_edges
++        if usage is None:
++            return {"action": "skip", "saturation": 0.0, "empty": n_edges, "n_edges": n_edges}
++        non_empty = int((usage > 0).sum().item())
++        empty = n_edges - non_empty
++        saturation = non_empty / max(n_edges, 1)
++        action = "keep"
++        if saturation < beta and n_edges > self.min_edges:
++            keep_count = max(self.min_edges, n_edges - delta_edges)
++            keep_idx = torch.argsort(usage, descending=True)[:keep_count].sort().values
++            self.edge_features = nn.Parameter(self.edge_features.data[keep_idx].clone().to(device))
++            action = "prune"
++        elif saturation > gamma and allow_add and n_edges < self.max_edges:
++            add_count = min(delta_edges, self.max_edges - n_edges)
++            source = torch.randint(0, n_edges, (add_count,), device=device)
++            noise = 0.01 * torch.randn(add_count, self.edge_features.shape[1], device=device)
++            added = self.edge_features.data[source] + noise
++            self.edge_features = nn.Parameter(torch.cat([self.edge_features.data, added], dim=0))
++            action = "add"
++        return {"action": action, "saturation": saturation, "empty": empty, "n_edges": self.n_edges}
++
++
+ # ====================================================================== #
+ #              Per-Modality Dual-Hypergraph Model (v9b)                   #
+ # ====================================================================== #
+@@ -91,11 +195,20 @@ class DualBranchDHGNN(nn.Module):
+         n_classes: int = 14,
+         n_layers: int = 3,
+         dropout: float = 0.2,
++        init_edge_features: Optional[List[torch.Tensor]] = None,
++        use_hsl_spatial: bool = False,
++        use_dynamic_feature: bool = False,
++        topk_edges: int = 3,
++        min_edges: int = 100,
++        max_edges: Optional[int] = None,
++        hsl_residual_strength: float = 0.5,
+     ):
+         super().__init__()
+         self.input_dims = input_dims
+         self.n_modalities = len(input_dims)
+         self.n_layers = n_layers
++        self.use_hsl_spatial = use_hsl_spatial
++        self.use_dynamic_feature = use_dynamic_feature
+ 
+         # ---- Per-modality encoders ----
+         self.encoders = nn.ModuleList()
+@@ -118,6 +231,13 @@ class DualBranchDHGNN(nn.Module):
+                 for _ in range(n_layers)
+             ]))
+ 
++        self.spatial_refiners = nn.ModuleList()
++        for _ in range(self.n_modalities):
++            self.spatial_refiners.append(nn.ModuleList([
++                HSLSpatialRefiner(hidden_dim, residual_strength=hsl_residual_strength)
++                for _ in range(n_layers)
++            ]))
++
+         # ---- Per-modality feature HGNNs (operate on modality-specific H_feature) ----
+         self.feature_convs = nn.ModuleList()
+         for _ in range(self.n_modalities):
+@@ -126,25 +246,28 @@ class DualBranchDHGNN(nn.Module):
+                 for _ in range(n_layers)
+             ]))
+ 
++        self.dynamic_feature_builders = nn.ModuleList()
++        if use_dynamic_feature:
++            if init_edge_features is None:
++                raise ValueError("init_edge_features is required when use_dynamic_feature=True")
++            for feats in init_edge_features:
++                self.dynamic_feature_builders.append(VariableBioDynamicFeatureHypergraph(
++                    feats, hidden_dim, topk_edges=topk_edges, min_edges=min_edges, max_edges=max_edges
++                ))
++
+         # ---- Per-modality intra-modal fusion gates ----
+         self.intra_gates = nn.ParameterList([
+-            nn.Parameter(torch.tensor(0.5)) for _ in range(self.n_modalities)
++            nn.Parameter(torch.tensor(0.0)) for _ in range(self.n_modalities)
+         ])
+         self.intra_norms = nn.ModuleList([
+             nn.LayerNorm(hidden_dim) for _ in range(self.n_modalities)
+         ])
+ 
+         # ---- Cross-modal fusion ----
+-        self.cross_gate = nn.Parameter(torch.tensor(0.5))
++        self.cross_gate = nn.Parameter(torch.tensor(0.0))
+         self.cross_norm = nn.LayerNorm(hidden_dim)
+ 
+-        # ---- Output heads ----
+-        self.classifier = nn.Sequential(
+-            nn.Linear(hidden_dim, hidden_dim),
+-            nn.GELU(),
+-            nn.Dropout(dropout),
+-            nn.Linear(hidden_dim, n_classes),
+-        )
++        # ---- Unsupervised DEC cluster centers ----
+         self.cluster_centers = Parameter(torch.randn(n_classes, hidden_dim) * 0.01)
+ 
+         # ---- Per-modality decoders ----
+@@ -156,43 +279,74 @@ class DualBranchDHGNN(nn.Module):
+                 nn.Linear(hidden_dim, dim),
+             ))
+ 
++    def adjust_dynamic_feature_edges(self, beta=0.90, gamma=0.98, delta_edges=20, allow_add=True):
++        if not self.use_dynamic_feature:
++            return []
++        logs = []
++        for m, builder in enumerate(self.dynamic_feature_builders):
++            log = builder.adjust_edges(beta=beta, gamma=gamma, delta_edges=delta_edges, allow_add=allow_add)
++            log["modality"] = m
++            logs.append(log)
++        return logs
++
++    def hsl_stats(self):
++        stats = []
++        for m, refiners in enumerate(self.spatial_refiners):
++            for layer_i, refiner in enumerate(refiners):
++                if refiner.last_stats:
++                    stats.append({"modality": m, "layer": layer_i, **refiner.last_stats})
++        return stats
++
+     def forward(self, x, sp_rows, sp_cols, sp_vals, n_spatial_edges,
+                 feat_tensors):
+         """
+         Parameters
+         ----------
+-        x : (N, sum(input_dims)) raw concatenated features
++        x : list of per-modality tensors, each shaped (N, input_dim_m)
+         sp_rows/cols/vals : spatial hypergraph sparse tensors
+         n_spatial_edges : number of spatial edges
+         feat_tensors : list of (ft_rows, ft_cols, ft_vals, n_feat_edges) per modality
+         """
+-        x_raw = x
+-        n_nodes = x.shape[0]
+-
+-        # ---- Per-modality encoding ----
++        if not isinstance(x, (list, tuple)):
++            raise TypeError("DualBranchDHGNN.forward expects a list/tuple of per-modality tensors; "
++                            "do not concatenate RNA and ATAC before the model.")
++        if len(x) != self.n_modalities:
++            raise ValueError(f"Expected {self.n_modalities} modality tensors, got {len(x)}")
++        x_raw = list(x)
++        n_nodes = x_raw[0].shape[0]
++
++        # ---- Per-modality encoding (no cross-omics concatenation at input) ----
+         mod_h = []
+-        offset = 0
+         for i in range(self.n_modalities):
+-            d = self.input_dims[i]
+-            mod_h.append(self.encoders[i](x[:, offset:offset + d]))
+-            offset += d
++            mod_h.append(self.encoders[i](x_raw[i]))
+ 
+         # ---- Per-modality dual HGNN message passing ----
+         mod_embeddings = []
+         mod_spatial_pre = []
+         mod_feature_pre = []
++        dynamic_feat_tensors = [None for _ in range(self.n_modalities)]
+ 
+         for m in range(self.n_modalities):
+-            ft_rows, ft_cols, ft_vals, n_feat_edges = feat_tensors[m]
+             h_s = mod_h[m]
+             h_f = mod_h[m]
+ 
+             for layer_i in range(self.n_layers):
+-                # Spatial conv on shared H_spatial
++                # Spatial conv on shared H_spatial with optional HSL incidence refinement
++                if self.use_hsl_spatial:
++                    sp_vals_layer = self.spatial_refiners[m][layer_i](
++                        h_s, sp_rows, sp_cols, sp_vals, n_nodes, n_spatial_edges
++                    )
++                else:
++                    sp_vals_layer = sp_vals
+                 h_s_new = self.spatial_convs[m][layer_i](
+-                    h_s, sp_rows, sp_cols, sp_vals, n_nodes, n_spatial_edges
++                    h_s, sp_rows, sp_cols, sp_vals_layer, n_nodes, n_spatial_edges
+                 )
+-                # Feature conv on modality-specific H_feature
++                # Feature conv on modality-specific static or dynamic H_feature
++                if self.use_dynamic_feature:
++                    ft_rows, ft_cols, ft_vals, n_feat_edges = self.dynamic_feature_builders[m](h_f)
++                    dynamic_feat_tensors[m] = (ft_rows, ft_cols, ft_vals, n_feat_edges)
++                else:
++                    ft_rows, ft_cols, ft_vals, n_feat_edges = feat_tensors[m]
+                 h_f_new = self.feature_convs[m][layer_i](
+                     h_f, ft_rows, ft_cols, ft_vals, n_nodes, n_feat_edges
+                 )
+@@ -202,7 +356,7 @@ class DualBranchDHGNN(nn.Module):
+                     mod_feature_pre.append(h_f_new)
+ 
+                 # Intra-modal fusion
+-                gate = self.intra_gates[m]
++                gate = torch.sigmoid(self.intra_gates[m])
+                 merged = gate * h_s_new + (1 - gate) * h_f_new
+                 h_s = self.intra_norms[m](merged)
+                 h_f = h_s  # share for next layer
+@@ -210,12 +364,10 @@ class DualBranchDHGNN(nn.Module):
+             mod_embeddings.append(h_s)
+ 
+         # ---- Cross-modal fusion ----
+-        gate = self.cross_gate
++        gate = torch.sigmoid(self.cross_gate)
+         fused = gate * mod_embeddings[0] + (1 - gate) * mod_embeddings[1]
+         embedding = self.cross_norm(fused)
+ 
+-        logits = self.classifier(embedding)
+-
+         dist = torch.sum(
+             (embedding.unsqueeze(1) - self.cluster_centers.unsqueeze(0)) ** 2, dim=2
+         )
+@@ -225,14 +377,13 @@ class DualBranchDHGNN(nn.Module):
+         mod_recons = [self.decoders[i](embedding) for i in range(self.n_modalities)]
+ 
+         return {
+-            "logits": logits,
+             "embedding": embedding,
+             "cluster_logits": cluster_logits,
+             "mod_recons": mod_recons,
+             "x_raw": x_raw,
+             "mod_spatial_pre": mod_spatial_pre,
+             "mod_feature_pre": mod_feature_pre,
+-            "feat_tensors": feat_tensors,
++            "feat_tensors": dynamic_feat_tensors if self.use_dynamic_feature else feat_tensors,
+         }
+ 
+ 
+@@ -271,26 +422,11 @@ def compute_total_loss(
+     # Per-modality reconstruction loss
+     x_raw = outputs["x_raw"]
+     recon_loss = torch.tensor(0.0, device=embedding.device)
+-    offset = 0
+-    for i, dim in enumerate(input_dims):
+-        recon_loss = recon_loss + F.mse_loss(outputs["mod_recons"][i], x_raw[:, offset:offset + dim])
+-        offset += dim
++    for i, _dim in enumerate(input_dims):
++        recon_loss = recon_loss + F.mse_loss(outputs["mod_recons"][i], x_raw[i])
+ 
+-    # Contrastive loss (optional)
++    # No supervised or semi-supervised objective is used in this unsupervised setting.
+     contrast_loss = torch.tensor(0.0, device=embedding.device)
+-    if lambda_contrast > 0 and len(outputs["mod_spatial_pre"]) >= 2:
+-        x_s = F.normalize(outputs["mod_spatial_pre"][0], dim=1)
+-        x_f = F.normalize(outputs["mod_feature_pre"][0], dim=1)
+-        sim_sf = x_s @ x_f.T / temperature
+-        sim_ss = x_s @ x_s.T / temperature
+-        sim_ff = x_f @ x_f.T / temperature
+-        mask = ~torch.eye(n_nodes, dtype=torch.bool, device=embedding.device)
+-        pos_scores = torch.diag(sim_sf)
+-        log_sum_neg = torch.logsumexp(
+-            torch.cat([sim_sf, sim_ss.masked_fill(~mask, float('-inf')),
+-                       sim_ff.masked_fill(~mask, float('-inf'))], dim=1), dim=1
+-        )
+-        contrast_loss = (-pos_scores + log_sum_neg).mean()
+ 
+     # DEC KL loss
+     if dec_phase:
+@@ -320,7 +456,6 @@ def compute_total_loss(
+ 
+     total = (
+         lambda_recon * recon_loss
+-        + lambda_contrast * contrast_loss
+         + lambda_cluster * clust_loss
+         + lambda_smooth * (sm_spatial + sm_feat_total)
+     )
+diff --git a/modal_1/run.py b/modal_1/run.py
+index b96fd94..782baae 100644
+--- a/modal_1/run.py
++++ b/modal_1/run.py
+@@ -42,6 +42,16 @@ def parse_args():
+     p.add_argument("--n_feature_edges", type=int, default=60)
+     p.add_argument("--k_nodes", type=int, default=15)
+     p.add_argument("--k_edges", type=int, default=8)
++    p.add_argument("--use_hsl_spatial", action=argparse.BooleanOptionalAction, default=True)
++    p.add_argument("--use_dynamic_feature", action=argparse.BooleanOptionalAction, default=True)
++    p.add_argument("--edge_adjust_interval", type=int, default=10)
++    p.add_argument("--delta_edges", type=int, default=20)
++    p.add_argument("--beta_saturation", type=float, default=0.90)
++    p.add_argument("--gamma_saturation", type=float, default=0.98)
++    p.add_argument("--topk_edges", type=int, default=3)
++    p.add_argument("--min_edges", type=int, default=100)
++    p.add_argument("--hsl_residual_strength", type=float, default=0.5)
++    p.add_argument("--allow_edge_add", action=argparse.BooleanOptionalAction, default=True)
+     p.add_argument("--dropout", type=float, default=0.3)
+ 
+     p.add_argument("--lr", type=float, default=0.001)
+@@ -142,6 +152,17 @@ def main():
+         lambda_cluster=args.lambda_cluster,
+         lambda_smooth=args.lambda_smooth,
+         max_spatial_edges=args.max_spatial_edges,
++        use_hsl_spatial=args.use_hsl_spatial,
++        use_dynamic_feature=args.use_dynamic_feature,
++        edge_adjust_interval=args.edge_adjust_interval,
++        delta_edges=args.delta_edges,
++        beta_saturation=args.beta_saturation,
++        gamma_saturation=args.gamma_saturation,
++        topk_edges=args.topk_edges,
++        min_edges=args.min_edges,
++        max_edges=coords.shape[0],
++        hsl_residual_strength=args.hsl_residual_strength,
++        allow_edge_add=args.allow_edge_add,
+     )
+ 
+     metrics = trainer.fit()
+diff --git a/modal_1/trainer.py b/modal_1/trainer.py
+index 6d73d2a..1473955 100644
+--- a/modal_1/trainer.py
++++ b/modal_1/trainer.py
+@@ -93,6 +93,13 @@ class DHGNNTrainer:
+         max_spatial_edges=2000,
+         gene_expression_matrices=None,
+         expression_features=None, expression_weight=True,
++        use_hsl_spatial=True, use_dynamic_feature=True,
++        edge_adjust_interval=10, delta_edges=20,
++        beta_saturation=0.90, gamma_saturation=0.98,
++        topk_edges=3, min_edges=100, max_edges=None,
++        hsl_residual_strength=0.5,
++        allow_edge_add=True,
++        n_feature_edges=None, k_nodes=None, k_edges=None,
+     ):
+         self.coords = coords
+         self.modality_data = modality_data
+@@ -100,9 +107,9 @@ class DHGNNTrainer:
+         self.seed = seed
+         self.device = torch.device(device)
+ 
+-        self.X = np.hstack(modality_data).astype(np.float32)
+-        self.n_nodes = self.X.shape[0]
+-        self.input_dims = [d.shape[1] for d in modality_data]
++        self.modality_data = [np.asarray(d, dtype=np.float32) for d in modality_data]
++        self.n_nodes = self.modality_data[0].shape[0]
++        self.input_dims = [d.shape[1] for d in self.modality_data]
+ 
+         self.n_classes = n_classes or (len(np.unique(labels)) if labels is not None else 14)
+         self.hidden_dim = hidden_dim
+@@ -121,9 +128,23 @@ class DHGNNTrainer:
+         self.gene_expression_matrices = gene_expression_matrices or []
+         self.expression_features = expression_features
+         self.expression_weight = expression_weight
++        self.use_hsl_spatial = use_hsl_spatial
++        self.use_dynamic_feature = use_dynamic_feature
++        self.edge_adjust_interval = edge_adjust_interval
++        self.delta_edges = delta_edges
++        self.beta_saturation = beta_saturation
++        self.gamma_saturation = gamma_saturation
++        self.topk_edges = topk_edges
++        self.min_edges = min_edges
++        self.max_edges = max_edges or self.n_nodes
++        self.hsl_residual_strength = hsl_residual_strength
++        self.allow_edge_add = allow_edge_add
+ 
+         self._build_spatial_hypergraph()
+-        self._build_feature_hypergraphs()
++        if self.use_dynamic_feature:
++            self.feat_tensors = None
++        else:
++            self._build_feature_hypergraphs()
+ 
+     def _build_spatial_hypergraph(self):
+         print("Building spatial hypergraph (Delaunay-star)...")
+@@ -146,9 +167,10 @@ class DHGNNTrainer:
+         modality_names = ["RNA", "ATAC"]
+         self.feat_tensors = []  # list of (ft_rows, ft_cols, ft_vals, n_feat_edges)
+ 
+-        for i, gene_mat in enumerate(self.gene_expression_matrices):
++        source_matrices = self.gene_expression_matrices or self.modality_data
++        for i, gene_mat in enumerate(source_matrices):
+             name = modality_names[i] if i < len(modality_names) else f"Modality_{i}"
+-            print(f"Building {name} feature hypergraph (gene-as-hyperedge)...")
++            print(f"Building {name} feature hypergraph (static feature-as-hyperedge)...")
+             H_gene, n_genes = gene_as_hyperedge(
+                 gene_mat,
+                 min_cells_pct=0.05,
+@@ -163,29 +185,37 @@ class DHGNNTrainer:
+             print(f"  Final: {n_feat_edges} edges, {len(ft_rows)} nnz")
+             self.feat_tensors.append((ft_rows, ft_cols, ft_vals, n_feat_edges))
+ 
+-    def _forward(self, model, X_tensor):
++    def _forward(self, model, modality_tensors):
+         return model(
+-            X_tensor,
++            modality_tensors,
+             self.sp_rows, self.sp_cols, self.sp_vals, self.n_spatial_edges,
+             self.feat_tensors,
+         )
+ 
+     def fit(self):
+-        X_tensor = torch.FloatTensor(self.X).to(self.device)
++        modality_tensors = [torch.FloatTensor(feats).to(self.device) for feats in self.modality_data]
+ 
++        init_edge_features = modality_tensors
+         model = DualBranchDHGNN(
+             input_dims=self.input_dims,
+             hidden_dim=self.hidden_dim,
+             n_classes=self.n_classes,
+             n_layers=self.n_layers,
+             dropout=self.dropout,
++            init_edge_features=init_edge_features if self.use_dynamic_feature else None,
++            use_hsl_spatial=self.use_hsl_spatial,
++            use_dynamic_feature=self.use_dynamic_feature,
++            topk_edges=self.topk_edges,
++            min_edges=self.min_edges,
++            max_edges=self.max_edges,
++            hsl_residual_strength=self.hsl_residual_strength,
+         ).to(self.device)
+ 
+         n_params = sum(p.numel() for p in model.parameters())
+         optimizer = Adam(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+         scheduler = CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=1e-6)
+ 
+-        best_ari = -1
++        best_loss = float("inf")
+         best_state = None
+         patience_counter = 0
+         best_epoch = 0
+@@ -194,13 +224,22 @@ class DHGNNTrainer:
+         print(f"\nTraining DvDHGNN v9b ({n_params:,} params)")
+         print(f"  Device: {self.device}, Nodes: {self.n_nodes}, Classes: {self.n_classes}")
+         for i, dim in enumerate(self.input_dims):
+-            n_feat = self.feat_tensors[i][3] if i < len(self.feat_tensors) else 0
++            if self.use_dynamic_feature:
++                n_feat = model.dynamic_feature_builders[i].n_edges
++                feature_desc = f"dynamic bio-initialized, {n_feat} edges, topk={self.topk_edges}"
++            else:
++                n_feat = self.feat_tensors[i][3] if i < len(self.feat_tensors) else 0
++                feature_desc = f"static gene-as-hyperedge, {n_feat} edges"
+             print(f"  Modality {i}: input_dim={dim}, encoder → {self.hidden_dim}, "
+-                  f"feature_hypergraph={n_feat} edges")
++                  f"feature_hypergraph={feature_desc}")
+         print(f"  Spatial: {self.n_spatial_edges} edges (shared Delaunay-star)")
+         print(f"  Losses: recon({self.lambda_recon}) + cluster({self.lambda_cluster}) "
+               f"+ smooth({self.lambda_smooth})")
+-        print(f"  Fusion: intra-modal gate → cross-modal gate")
++        print(f"  HSL spatial: {self.use_hsl_spatial}; dynamic feature: {self.use_dynamic_feature}")
++        print(f"  Edge adjustment: interval={self.edge_adjust_interval}, delta={self.delta_edges}, "
++              f"beta={self.beta_saturation}, gamma={self.gamma_saturation}, "
++              f"allow_add={self.allow_edge_add}")
++        print(f"  Fusion: sigmoid intra-modal gate → sigmoid cross-modal gate")
+         print(f"  Warmup: {self.warmup_epochs} → DEC KL")
+         print()
+ 
+@@ -212,7 +251,7 @@ class DHGNNTrainer:
+                 print(f"\n>>> Warmup complete. Initializing DEC...")
+                 model.eval()
+                 with torch.no_grad():
+-                    emb = self._forward(model, X_tensor)["embedding"].cpu().numpy()
++                    emb = self._forward(model, modality_tensors)["embedding"].cpu().numpy()
+                 km = KMeans(n_clusters=self.n_classes, n_init=20, random_state=self.seed, max_iter=300)
+                 km.fit(emb)
+                 model.cluster_centers.data.copy_(torch.FloatTensor(km.cluster_centers_).to(self.device))
+@@ -221,7 +260,7 @@ class DHGNNTrainer:
+                 print(f"  KMeans init ARI: {init_ari:.4f}")
+                 model.train()
+ 
+-            outputs = self._forward(model, X_tensor)
++            outputs = self._forward(model, modality_tensors)
+             loss, loss_dict = compute_total_loss(
+                 outputs, self.sp_rows, self.sp_cols, self.sp_vals,
+                 self.n_nodes, self.n_spatial_edges, self.input_dims,
+@@ -238,19 +277,39 @@ class DHGNNTrainer:
+             optimizer.step()
+             scheduler.step()
+ 
++            if self.use_dynamic_feature and self.edge_adjust_interval > 0 and epoch > 0 and epoch % self.edge_adjust_interval == 0:
++                edge_logs = model.adjust_dynamic_feature_edges(
++                    beta=self.beta_saturation, gamma=self.gamma_saturation,
++                    delta_edges=self.delta_edges, allow_add=self.allow_edge_add
++                )
++                optimizer = Adam(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
++                scheduler = CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=1e-6)
++                names = ["RNA", "ATAC"]
++                print(f"Epoch {epoch+1} dynamic edge adjustment:")
++                for log in edge_logs:
++                    name = names[log["modality"]] if log["modality"] < len(names) else f"Modality_{log['modality']}"
++                    print(f"  {name}: action={log['action']}, S={log['saturation']:.3f}, "
++                          f"empty={log['empty']}, n_edges={log['n_edges']}")
++
++            if self.use_hsl_spatial and ((epoch + 1) % 20 == 0 or epoch == 0):
++                for st in model.hsl_stats()[:2]:
++                    print(f"  HSL m{st['modality']} layer{st['layer']}: "
++                          f"min={st['min']:.4f}, max={st['max']:.4f}, mean={st['mean']:.4f}")
++
+             if (epoch + 1) % 5 == 0 or epoch == 0:
+                 model.eval()
+                 with torch.no_grad():
+-                    metrics = self._evaluate(model, X_tensor)
++                    metrics = self._evaluate(model, modality_tensors)
+ 
+-                current_ari = metrics.get("ari", -1)
+-                if current_ari > best_ari:
+-                    best_ari = current_ari
++                current_loss = loss_dict["total"]
++                if current_loss < best_loss - 1e-6:
++                    best_loss = current_loss
+                     best_state = copy.deepcopy(model.state_dict())
+                     best_epoch = epoch
+                     patience_counter = 0
+                 else:
+                     patience_counter += 1
++                current_ari = metrics.get("ari", -1)
+ 
+                 phase = "DEC" if dec_initialized else "warmup"
+                 if (epoch + 1) % 20 == 0 or epoch == 0:
+@@ -260,7 +319,7 @@ class DHGNNTrainer:
+                         f"(recon={loss_dict.get('recon', 0):.3f}, "
+                         f"clust={loss_dict.get('cluster', 0):.3f}, "
+                         f"sm_s={loss_dict.get('smooth_s', 0):.3f}) | "
+-                        f"ARI {current_ari:.4f} (best {best_ari:.4f}@{best_epoch+1}) | "
++                        f"ARI {current_ari:.4f} | best_loss {best_loss:.4f}@{best_epoch+1} | "
+                         f"{time.time()-t0:.1f}s"
+                     )
+ 
+@@ -273,9 +332,9 @@ class DHGNNTrainer:
+ 
+         model.eval()
+         with torch.no_grad():
+-            metrics = self._evaluate(model, X_tensor)
++            metrics = self._evaluate(model, modality_tensors)
+ 
+-        print(f"\nBest ARI: {best_ari:.4f} at epoch {best_epoch+1}")
++        print(f"\nBest loss: {best_loss:.4f} at epoch {best_epoch+1}")
+         if "ari" in metrics:
+             print(f"Final: ARI={metrics['ari']:.4f}, NMI={metrics['nmi']:.4f}")
+ 
+@@ -284,8 +343,8 @@ class DHGNNTrainer:
+         self.predictions = metrics.get("predictions", None)
+         return metrics
+ 
+-    def _evaluate(self, model, X_tensor):
+-        outputs = self._forward(model, X_tensor)
++    def _evaluate(self, model, modality_tensors):
++        outputs = self._forward(model, modality_tensors)
+         embedding = outputs["embedding"].cpu().numpy()
+         km = KMeans(n_clusters=self.n_classes, n_init=20, random_state=self.seed, max_iter=500)
+         predictions = km.fit_predict(embedding)
