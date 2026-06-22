@@ -1,9 +1,9 @@
 diff --git a/modal_1/README.md b/modal_1/README.md
 new file mode 100644
-index 0000000..88f2e93
+index 0000000..0913afe
 --- /dev/null
 +++ b/modal_1/README.md
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,166 @@
 +# HSL-DvDHGNN (`modal_1`)
 +
 +This folder contains the current unsupervised spatial multi-omics model implementation.
@@ -157,6 +157,10 @@ index 0000000..88f2e93
 +| `--min_edges` | Minimum number of feature hyperedges after pruning. |
 +| `--allow_edge_add` / `--no-allow_edge_add` | Allow or forbid feature hyperedge expansion. |
 +| `--hsl_residual_strength` | Residual strength for HSL incidence refinement. |
++| `--warmup_epochs` | Number of reconstruction/smoothness warmup epochs before DEC cluster loss starts. |
++| `--lambda_recon` | Weight for reconstruction loss. |
++| `--lambda_cluster` | Weight for DEC cluster loss after warmup. |
++| `--lambda_smooth` | Weight for spatial/feature smoothness loss. |
 +
 +## Notes
 +
@@ -522,10 +526,10 @@ index e661964..411844b 100644
          + lambda_smooth * (sm_spatial + sm_feat_total)
      )
 diff --git a/modal_1/run.py b/modal_1/run.py
-index b96fd94..782baae 100644
+index b96fd94..4b53083 100644
 --- a/modal_1/run.py
 +++ b/modal_1/run.py
-@@ -42,6 +42,16 @@ def parse_args():
+@@ -42,13 +42,25 @@ def parse_args():
      p.add_argument("--n_feature_edges", type=int, default=60)
      p.add_argument("--k_nodes", type=int, default=15)
      p.add_argument("--k_edges", type=int, default=8)
@@ -542,9 +546,25 @@ index b96fd94..782baae 100644
      p.add_argument("--dropout", type=float, default=0.3)
  
      p.add_argument("--lr", type=float, default=0.001)
-@@ -142,6 +152,17 @@ def main():
+     p.add_argument("--weight_decay", type=float, default=1e-4)
+     p.add_argument("--epochs", type=int, default=500)
+     p.add_argument("--patience", type=int, default=50)
++    p.add_argument("--warmup_epochs", type=int, default=80)
+ 
++    p.add_argument("--lambda_recon", type=float, default=0.5)
+     p.add_argument("--lambda_cluster", type=float, default=1.0)
+     p.add_argument("--lambda_smooth", type=float, default=0.1)
+     p.add_argument("--max_spatial_edges", type=int, default=1500)
+@@ -137,11 +149,24 @@ def main():
+         weight_decay=args.weight_decay,
+         epochs=args.epochs,
+         patience=args.patience,
++        warmup_epochs=args.warmup_epochs,
+         seed=args.seed,
+         device=device,
          lambda_cluster=args.lambda_cluster,
          lambda_smooth=args.lambda_smooth,
++        lambda_recon=args.lambda_recon,
          max_spatial_edges=args.max_spatial_edges,
 +        use_hsl_spatial=args.use_hsl_spatial,
 +        use_dynamic_feature=args.use_dynamic_feature,

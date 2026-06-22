@@ -151,6 +151,10 @@ python -m modal_1.run \
 | `--min_edges` | Minimum number of feature hyperedges after pruning. |
 | `--allow_edge_add` / `--no-allow_edge_add` | Allow or forbid feature hyperedge expansion. |
 | `--hsl_residual_strength` | Residual strength for HSL incidence refinement. |
+| `--warmup_epochs` | Number of reconstruction/smoothness warmup epochs before DEC cluster loss starts. |
+| `--lambda_recon` | Weight for reconstruction loss. |
+| `--lambda_cluster` | Weight for DEC cluster loss after warmup. |
+| `--lambda_smooth` | Weight for spatial/feature smoothness loss. |
 
 ## Notes
 

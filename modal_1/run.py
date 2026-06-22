@@ -58,7 +58,9 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--epochs", type=int, default=500)
     p.add_argument("--patience", type=int, default=50)
+    p.add_argument("--warmup_epochs", type=int, default=80)
 
+    p.add_argument("--lambda_recon", type=float, default=0.5)
     p.add_argument("--lambda_cluster", type=float, default=1.0)
     p.add_argument("--lambda_smooth", type=float, default=0.1)
     p.add_argument("--max_spatial_edges", type=int, default=1500)
@@ -147,10 +149,12 @@ def main():
         weight_decay=args.weight_decay,
         epochs=args.epochs,
         patience=args.patience,
+        warmup_epochs=args.warmup_epochs,
         seed=args.seed,
         device=device,
         lambda_cluster=args.lambda_cluster,
         lambda_smooth=args.lambda_smooth,
+        lambda_recon=args.lambda_recon,
         max_spatial_edges=args.max_spatial_edges,
         use_hsl_spatial=args.use_hsl_spatial,
         use_dynamic_feature=args.use_dynamic_feature,
