@@ -219,6 +219,9 @@ class DHGNNTrainer:
         best_model = None
         patience_counter = 0
         best_epoch = 0
+        best_observed_ari = -1.0
+        best_observed_nmi = -1.0
+        best_observed_epoch = 0
         dec_initialized = False
 
         print(f"\nTraining DvDHGNN v9b ({n_params:,} params)")
@@ -265,6 +268,9 @@ class DHGNNTrainer:
                 best_model = None
                 patience_counter = 0
                 best_epoch = epoch
+                best_observed_ari = -1.0
+                best_observed_nmi = -1.0
+                best_observed_epoch = epoch
                 print("  Reset best-loss tracking for DEC phase.")
                 model.train()
 
@@ -318,6 +324,11 @@ class DHGNNTrainer:
                 else:
                     patience_counter += 1
                 current_ari = metrics.get("ari", -1)
+                current_nmi = metrics.get("nmi", -1)
+                if self.labels is not None and current_ari > best_observed_ari:
+                    best_observed_ari = current_ari
+                    best_observed_nmi = current_nmi
+                    best_observed_epoch = epoch
 
                 phase = "DEC" if dec_initialized else "warmup"
                 if (epoch + 1) % 20 == 0 or epoch == 0:
@@ -345,6 +356,14 @@ class DHGNNTrainer:
         print(f"\nBest loss: {best_loss:.4f} at epoch {best_epoch+1}")
         if "ari" in metrics:
             print(f"Final: ARI={metrics['ari']:.4f}, NMI={metrics['nmi']:.4f}")
+            metrics["best_observed_ari"] = best_observed_ari
+            metrics["best_observed_nmi"] = best_observed_nmi
+            metrics["best_observed_epoch"] = best_observed_epoch + 1
+            print(
+                f"Best observed ARI during training: {best_observed_ari:.4f} "
+                f"at epoch {best_observed_epoch+1} "
+                f"(NMI={best_observed_nmi:.4f}; label-based report only)"
+            )
 
         self.model = model
         self.embeddings = metrics.get("embedding", None)

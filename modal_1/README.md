@@ -137,6 +137,32 @@ python -m modal_1.run \
   --allow_edge_add
 ```
 
+### Parameter sweep
+
+Use `param_sweep.py` to load/preprocess the data once and run a comma-separated
+grid of parameter values. The script writes one row per run to `sweep_results.csv`
+by default.
+
+```bash
+python -m modal_1.param_sweep \
+  --warmup_epochs 120 \
+  --lambda_recon 0.5,0.4 \
+  --lambda_cluster 3.0,2.0 \
+  --lambda_smooth 0.05 \
+  --topk_edges 12 \
+  --edge_adjust_interval 10 \
+  --delta_edges 50 \
+  --beta_saturation 0.90 \
+  --gamma_saturation 0.60 \
+  --hsl_residual_strength 0.3,0.5 \
+  --output_csv sweep_results.csv
+```
+
+For a quick check of the generated grid without training, add `--dry_run`. When
+labels are available, the CSV includes both the final metrics selected by
+unsupervised loss and label-based `best_observed_ari`/`best_observed_epoch` for
+debugging only.
+
 ## Key CLI arguments
 
 | Argument | Meaning |
@@ -155,6 +181,9 @@ python -m modal_1.run \
 | `--lambda_recon` | Weight for reconstruction loss. |
 | `--lambda_cluster` | Weight for DEC cluster loss after warmup. |
 | `--lambda_smooth` | Weight for spatial/feature smoothness loss. |
+| `modal_1/param_sweep.py --output_csv` | CSV file receiving one result row per parameter combination. |
+| `modal_1/param_sweep.py --max_runs` | Limit the sweep to the first N grid combinations; `0` means all. |
+| `modal_1/param_sweep.py --dry_run` | Print parameter combinations without training. |
 
 ## Notes
 

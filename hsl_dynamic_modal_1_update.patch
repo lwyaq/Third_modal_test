@@ -1,9 +1,9 @@
 diff --git a/modal_1/README.md b/modal_1/README.md
 new file mode 100644
-index 0000000..0913afe
+index 0000000..65c482e
 --- /dev/null
 +++ b/modal_1/README.md
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,195 @@
 +# HSL-DvDHGNN (`modal_1`)
 +
 +This folder contains the current unsupervised spatial multi-omics model implementation.
@@ -143,6 +143,32 @@ index 0000000..0913afe
 +  --allow_edge_add
 +```
 +
++### Parameter sweep
++
++Use `param_sweep.py` to load/preprocess the data once and run a comma-separated
++grid of parameter values. The script writes one row per run to `sweep_results.csv`
++by default.
++
++```bash
++python -m modal_1.param_sweep \
++  --warmup_epochs 120 \
++  --lambda_recon 0.5,0.4 \
++  --lambda_cluster 3.0,2.0 \
++  --lambda_smooth 0.05 \
++  --topk_edges 12 \
++  --edge_adjust_interval 10 \
++  --delta_edges 50 \
++  --beta_saturation 0.90 \
++  --gamma_saturation 0.60 \
++  --hsl_residual_strength 0.3,0.5 \
++  --output_csv sweep_results.csv
++```
++
++For a quick check of the generated grid without training, add `--dry_run`. When
++labels are available, the CSV includes both the final metrics selected by
++unsupervised loss and label-based `best_observed_ari`/`best_observed_epoch` for
++debugging only.
++
 +## Key CLI arguments
 +
 +| Argument | Meaning |
@@ -161,6 +187,9 @@ index 0000000..0913afe
 +| `--lambda_recon` | Weight for reconstruction loss. |
 +| `--lambda_cluster` | Weight for DEC cluster loss after warmup. |
 +| `--lambda_smooth` | Weight for spatial/feature smoothness loss. |
++| `modal_1/param_sweep.py --output_csv` | CSV file receiving one result row per parameter combination. |
++| `modal_1/param_sweep.py --max_runs` | Limit the sweep to the first N grid combinations; `0` means all. |
++| `modal_1/param_sweep.py --dry_run` | Print parameter combinations without training. |
 +
 +## Notes
 +
@@ -525,6 +554,294 @@ index e661964..411844b 100644
          + lambda_cluster * clust_loss
          + lambda_smooth * (sm_spatial + sm_feat_total)
      )
+diff --git a/modal_1/param_sweep.py b/modal_1/param_sweep.py
+new file mode 100644
+index 0000000..632fb91
+--- /dev/null
++++ b/modal_1/param_sweep.py
+@@ -0,0 +1,282 @@
++"""
++Parameter sweep runner for HSL-DvDHGNN on E18.5 mouse brain data.
++
++This script loads/preprocesses RNA + ATAC once, then trains multiple
++DHGNNTrainer configurations. It writes one CSV row per run so long sweeps can
++be resumed or inspected even if a later configuration fails.
++
++Example:
++    python modal_1/param_sweep.py ^
++      --warmup_epochs 120 ^
++      --lambda_recon 0.5,0.4 ^
++      --lambda_cluster 3.0,2.0 ^
++      --hsl_residual_strength 0.3,0.5
++"""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import itertools
++import os
++import sys
++import time
++import traceback
++import warnings
++from typing import Iterable, List
++
++import numpy as np
++import scanpy as sc
++import torch
++
++warnings.filterwarnings("ignore")
++
++# Ensure modal_1 is importable when this file is run directly.
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from modal_1.preprocessing import extract_coords, lsi, pca
++from modal_1.trainer import DHGNNTrainer
++from modal_1.utils import label_encode, setup_seed
++
++
++def _parse_list(value: str, cast):
++    """Parse comma-separated CLI values, e.g. '0.5,0.4'."""
++    if isinstance(value, (list, tuple)):
++        return list(value)
++    return [cast(v.strip()) for v in str(value).split(",") if v.strip() != ""]
++
++
++def _bool_to_cli(value: bool) -> str:
++    return "true" if value else "false"
++
++
++def parse_args():
++    p = argparse.ArgumentParser(description="Grid-search HSL-DvDHGNN parameters")
++
++    # Data and preprocessing.
++    p.add_argument("--data_dir", type=str, default="data/E18.5_mouse_brain")
++    p.add_argument("--rna_file", type=str, default="E18_adata_rna.h5ad")
++    p.add_argument("--atac_file", type=str, default="E18_adata_atac.h5ad")
++    p.add_argument("--label_col", type=str, default="Combined_Clusters_annotation")
++    p.add_argument("--n_pca", type=int, default=50)
++    p.add_argument("--n_lsi", type=int, default=51)
++    p.add_argument("--n_top_genes", type=int, default=3000)
++
++    # Fixed model/training defaults.
++    p.add_argument("--hidden_dim", type=int, default=128)
++    p.add_argument("--n_layers", type=int, default=3)
++    p.add_argument("--epochs", type=int, default=500)
++    p.add_argument("--patience", type=int, default=50)
++    p.add_argument("--weight_decay", type=float, default=1e-4)
++    p.add_argument("--max_spatial_edges", type=int, default=1500)
++    p.add_argument("--min_edges", type=int, default=100)
++    p.add_argument("--device", type=str, default="auto")
++    p.add_argument("--output_csv", type=str, default="sweep_results.csv")
++    p.add_argument("--max_runs", type=int, default=0, help="0 means run the full grid")
++    p.add_argument("--dry_run", action="store_true", help="Print the grid without training")
++
++    # Boolean switches.
++    p.add_argument("--use_hsl_spatial", action=argparse.BooleanOptionalAction, default=True)
++    p.add_argument("--use_dynamic_feature", action=argparse.BooleanOptionalAction, default=True)
++    p.add_argument("--allow_edge_add", action=argparse.BooleanOptionalAction, default=True)
++
++    # Sweep dimensions. Values are comma-separated lists.
++    p.add_argument("--seeds", type=str, default="42")
++    p.add_argument("--lr", type=str, default="0.001")
++    p.add_argument("--dropout", type=str, default="0.3")
++    p.add_argument("--warmup_epochs", type=str, default="120")
++    p.add_argument("--lambda_recon", type=str, default="0.5,0.4")
++    p.add_argument("--lambda_cluster", type=str, default="3.0,2.0")
++    p.add_argument("--lambda_smooth", type=str, default="0.05")
++    p.add_argument("--topk_edges", type=str, default="12")
++    p.add_argument("--edge_adjust_interval", type=str, default="10")
++    p.add_argument("--delta_edges", type=str, default="50")
++    p.add_argument("--beta_saturation", type=str, default="0.90")
++    p.add_argument("--gamma_saturation", type=str, default="0.60")
++    p.add_argument("--hsl_residual_strength", type=str, default="0.3,0.5")
++
++    return p.parse_args()
++
++
++def load_modalities(args):
++    """Load and preprocess RNA/ATAC once for all sweep runs."""
++    rna_path = os.path.join(args.data_dir, args.rna_file)
++    atac_path = os.path.join(args.data_dir, args.atac_file)
++
++    print(f"\nLoading RNA data from {rna_path}...")
++    adata_rna = sc.read_h5ad(rna_path)
++
++    print(f"Loading ATAC data from {atac_path}...")
++    adata_atac = sc.read_h5ad(atac_path)
++
++    print("\nPreprocessing RNA...")
++    sc.pp.filter_genes(adata_rna, min_cells=10)
++    sc.pp.normalize_total(adata_rna, target_sum=1e4)
++    sc.pp.log1p(adata_rna)
++    sc.pp.highly_variable_genes(
++        adata_rna,
++        flavor="seurat_v3",
++        n_top_genes=args.n_top_genes,
++        check_values=False,
++    )
++    sc.pp.scale(adata_rna)
++    adata_rna_high = adata_rna[:, adata_rna.var["highly_variable"]]
++    rna_features = pca(adata_rna_high, n_comps=args.n_pca, random_state=42)
++
++    print("Preprocessing ATAC...")
++    adata_atac = adata_atac[adata_rna.obs_names].copy()
++    if "X_lsi" not in adata_atac.obsm.keys():
++        sc.pp.highly_variable_genes(
++            adata_atac,
++            flavor="seurat_v3",
++            n_top_genes=args.n_top_genes,
++            check_values=False,
++        )
++        lsi(adata_atac, use_highly_variable=False, n_components=args.n_lsi)
++    atac_features = adata_atac.obsm["X_lsi"].copy()
++
++    coords = extract_coords(adata_atac)
++
++    if args.label_col in adata_atac.obs.columns:
++        raw_labels = adata_atac.obs[args.label_col].astype(str).values
++        labels = label_encode(raw_labels)
++        n_classes = len(np.unique(labels))
++        print(f"\nLabels: {n_classes} classes from '{args.label_col}'")
++    else:
++        labels = None
++        n_classes = 14
++        print(f"\nNo label column '{args.label_col}' found; unsupervised mode.")
++
++    print(f"RNA features: {rna_features.shape}")
++    print(f"ATAC features: {atac_features.shape}")
++    print(f"Coordinates: {coords.shape}")
++    print(f"Nodes: {coords.shape[0]}")
++
++    return [rna_features, atac_features], coords, labels, n_classes
++
++
++def build_grid(args) -> List[dict]:
++    dimensions = {
++        "seed": _parse_list(args.seeds, int),
++        "lr": _parse_list(args.lr, float),
++        "dropout": _parse_list(args.dropout, float),
++        "warmup_epochs": _parse_list(args.warmup_epochs, int),
++        "lambda_recon": _parse_list(args.lambda_recon, float),
++        "lambda_cluster": _parse_list(args.lambda_cluster, float),
++        "lambda_smooth": _parse_list(args.lambda_smooth, float),
++        "topk_edges": _parse_list(args.topk_edges, int),
++        "edge_adjust_interval": _parse_list(args.edge_adjust_interval, int),
++        "delta_edges": _parse_list(args.delta_edges, int),
++        "beta_saturation": _parse_list(args.beta_saturation, float),
++        "gamma_saturation": _parse_list(args.gamma_saturation, float),
++        "hsl_residual_strength": _parse_list(args.hsl_residual_strength, float),
++    }
++    keys = list(dimensions.keys())
++    grid = [dict(zip(keys, values)) for values in itertools.product(*(dimensions[k] for k in keys))]
++    if args.max_runs and args.max_runs > 0:
++        grid = grid[: args.max_runs]
++    return grid
++
++
++def append_result(path: str, row: dict, fieldnames: Iterable[str]):
++    file_exists = os.path.exists(path)
++    with open(path, "a", newline="", encoding="utf-8") as f:
++        writer = csv.DictWriter(f, fieldnames=fieldnames)
++        if not file_exists:
++            writer.writeheader()
++        writer.writerow({k: row.get(k, "") for k in fieldnames})
++
++
++def main():
++    args = parse_args()
++    device = args.device
++    if device == "auto":
++        device = "cuda" if torch.cuda.is_available() else "cpu"
++
++    grid = build_grid(args)
++    print(f"Prepared {len(grid)} sweep run(s). Device: {device}")
++    for i, cfg in enumerate(grid, start=1):
++        print(f"  [{i:03d}] {cfg}")
++    if args.dry_run:
++        return
++
++    modality_data, coords, labels, n_classes = load_modalities(args)
++
++    fieldnames = [
++        "run_id", "status", "elapsed_sec", "error",
++        "ari", "nmi", "ami", "silhouette",
++        "best_observed_ari", "best_observed_nmi", "best_observed_epoch",
++        "seed", "lr", "dropout", "warmup_epochs",
++        "lambda_recon", "lambda_cluster", "lambda_smooth",
++        "topk_edges", "edge_adjust_interval", "delta_edges",
++        "beta_saturation", "gamma_saturation", "hsl_residual_strength",
++        "use_hsl_spatial", "use_dynamic_feature", "allow_edge_add",
++    ]
++
++    for run_id, cfg in enumerate(grid, start=1):
++        print("\n" + "=" * 80)
++        print(f"SWEEP RUN {run_id}/{len(grid)}")
++        print(cfg)
++        print("=" * 80)
++
++        setup_seed(cfg["seed"])
++        t0 = time.time()
++        row = {
++            "run_id": run_id,
++            "status": "ok",
++            "error": "",
++            "use_hsl_spatial": _bool_to_cli(args.use_hsl_spatial),
++            "use_dynamic_feature": _bool_to_cli(args.use_dynamic_feature),
++            "allow_edge_add": _bool_to_cli(args.allow_edge_add),
++            **cfg,
++        }
++
++        try:
++            trainer = DHGNNTrainer(
++                coords=coords,
++                modality_data=modality_data,
++                labels=labels,
++                n_classes=n_classes,
++                hidden_dim=args.hidden_dim,
++                n_layers=args.n_layers,
++                dropout=cfg["dropout"],
++                lr=cfg["lr"],
++                weight_decay=args.weight_decay,
++                epochs=args.epochs,
++                patience=args.patience,
++                warmup_epochs=cfg["warmup_epochs"],
++                seed=cfg["seed"],
++                device=device,
++                lambda_recon=cfg["lambda_recon"],
++                lambda_cluster=cfg["lambda_cluster"],
++                lambda_smooth=cfg["lambda_smooth"],
++                max_spatial_edges=args.max_spatial_edges,
++                use_hsl_spatial=args.use_hsl_spatial,
++                use_dynamic_feature=args.use_dynamic_feature,
++                edge_adjust_interval=cfg["edge_adjust_interval"],
++                delta_edges=cfg["delta_edges"],
++                beta_saturation=cfg["beta_saturation"],
++                gamma_saturation=cfg["gamma_saturation"],
++                topk_edges=cfg["topk_edges"],
++                min_edges=args.min_edges,
++                max_edges=coords.shape[0],
++                hsl_residual_strength=cfg["hsl_residual_strength"],
++                allow_edge_add=args.allow_edge_add,
++            )
++            metrics = trainer.fit()
++            for key, value in metrics.items():
++                if isinstance(value, (int, float, np.integer, np.floating)):
++                    row[key] = float(value)
++        except Exception as exc:
++            row["status"] = "error"
++            row["error"] = f"{type(exc).__name__}: {exc}"
++            print("Run failed:")
++            traceback.print_exc()
++        finally:
++            row["elapsed_sec"] = round(time.time() - t0, 2)
++            append_result(args.output_csv, row, fieldnames)
++            print(f"Saved result to {args.output_csv}")
++
++
++if __name__ == "__main__":
++    main()
 diff --git a/modal_1/run.py b/modal_1/run.py
 index b96fd94..4b53083 100644
 --- a/modal_1/run.py
@@ -581,7 +898,7 @@ index b96fd94..4b53083 100644
  
      metrics = trainer.fit()
 diff --git a/modal_1/trainer.py b/modal_1/trainer.py
-index 6d73d2a..0963592 100644
+index 6d73d2a..c989807 100644
 --- a/modal_1/trainer.py
 +++ b/modal_1/trainer.py
 @@ -93,6 +93,13 @@ class DHGNNTrainer:
@@ -649,7 +966,7 @@ index 6d73d2a..0963592 100644
              H_gene, n_genes = gene_as_hyperedge(
                  gene_mat,
                  min_cells_pct=0.05,
-@@ -163,30 +185,38 @@ class DHGNNTrainer:
+@@ -163,44 +185,64 @@ class DHGNNTrainer:
              print(f"  Final: {n_feat_edges} edges, {len(ft_rows)} nnz")
              self.feat_tensors.append((ft_rows, ft_cols, ft_vals, n_feat_edges))
  
@@ -692,8 +1009,11 @@ index 6d73d2a..0963592 100644
 +        best_model = None
          patience_counter = 0
          best_epoch = 0
++        best_observed_ari = -1.0
++        best_observed_nmi = -1.0
++        best_observed_epoch = 0
          dec_initialized = False
-@@ -194,13 +224,22 @@ class DHGNNTrainer:
+ 
          print(f"\nTraining DvDHGNN v9b ({n_params:,} params)")
          print(f"  Device: {self.device}, Nodes: {self.n_nodes}, Classes: {self.n_classes}")
          for i, dim in enumerate(self.input_dims):
@@ -719,7 +1039,7 @@ index 6d73d2a..0963592 100644
          print(f"  Warmup: {self.warmup_epochs} → DEC KL")
          print()
  
-@@ -212,16 +251,24 @@ class DHGNNTrainer:
+@@ -212,16 +254,27 @@ class DHGNNTrainer:
                  print(f"\n>>> Warmup complete. Initializing DEC...")
                  model.eval()
                  with torch.no_grad():
@@ -738,6 +1058,9 @@ index 6d73d2a..0963592 100644
 +                best_model = None
 +                patience_counter = 0
 +                best_epoch = epoch
++                best_observed_ari = -1.0
++                best_observed_nmi = -1.0
++                best_observed_epoch = epoch
 +                print("  Reset best-loss tracking for DEC phase.")
                  model.train()
  
@@ -746,7 +1069,7 @@ index 6d73d2a..0963592 100644
              loss, loss_dict = compute_total_loss(
                  outputs, self.sp_rows, self.sp_cols, self.sp_vals,
                  self.n_nodes, self.n_spatial_edges, self.input_dims,
-@@ -238,19 +285,39 @@ class DHGNNTrainer:
+@@ -238,19 +291,44 @@ class DHGNNTrainer:
              optimizer.step()
              scheduler.step()
  
@@ -788,10 +1111,15 @@ index 6d73d2a..0963592 100644
                  else:
                      patience_counter += 1
 +                current_ari = metrics.get("ari", -1)
++                current_nmi = metrics.get("nmi", -1)
++                if self.labels is not None and current_ari > best_observed_ari:
++                    best_observed_ari = current_ari
++                    best_observed_nmi = current_nmi
++                    best_observed_epoch = epoch
  
                  phase = "DEC" if dec_initialized else "warmup"
                  if (epoch + 1) % 20 == 0 or epoch == 0:
-@@ -260,7 +327,7 @@ class DHGNNTrainer:
+@@ -260,7 +338,7 @@ class DHGNNTrainer:
                          f"(recon={loss_dict.get('recon', 0):.3f}, "
                          f"clust={loss_dict.get('cluster', 0):.3f}, "
                          f"sm_s={loss_dict.get('smooth_s', 0):.3f}) | "
@@ -800,7 +1128,7 @@ index 6d73d2a..0963592 100644
                          f"{time.time()-t0:.1f}s"
                      )
  
-@@ -268,14 +335,14 @@ class DHGNNTrainer:
+@@ -268,24 +346,32 @@ class DHGNNTrainer:
                      print(f"Early stopping at epoch {epoch+1}")
                      break
  
@@ -818,8 +1146,17 @@ index 6d73d2a..0963592 100644
 +        print(f"\nBest loss: {best_loss:.4f} at epoch {best_epoch+1}")
          if "ari" in metrics:
              print(f"Final: ARI={metrics['ari']:.4f}, NMI={metrics['nmi']:.4f}")
++            metrics["best_observed_ari"] = best_observed_ari
++            metrics["best_observed_nmi"] = best_observed_nmi
++            metrics["best_observed_epoch"] = best_observed_epoch + 1
++            print(
++                f"Best observed ARI during training: {best_observed_ari:.4f} "
++                f"at epoch {best_observed_epoch+1} "
++                f"(NMI={best_observed_nmi:.4f}; label-based report only)"
++            )
  
-@@ -284,8 +351,8 @@ class DHGNNTrainer:
+         self.model = model
+         self.embeddings = metrics.get("embedding", None)
          self.predictions = metrics.get("predictions", None)
          return metrics
  
