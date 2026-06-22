@@ -561,7 +561,7 @@ index b96fd94..782baae 100644
  
      metrics = trainer.fit()
 diff --git a/modal_1/trainer.py b/modal_1/trainer.py
-index 6d73d2a..1473955 100644
+index 6d73d2a..dd8f993 100644
 --- a/modal_1/trainer.py
 +++ b/modal_1/trainer.py
 @@ -93,6 +93,13 @@ class DHGNNTrainer:
@@ -629,7 +629,7 @@ index 6d73d2a..1473955 100644
              H_gene, n_genes = gene_as_hyperedge(
                  gene_mat,
                  min_cells_pct=0.05,
-@@ -163,29 +185,37 @@ class DHGNNTrainer:
+@@ -163,30 +185,38 @@ class DHGNNTrainer:
              print(f"  Final: {n_feat_edges} edges, {len(ft_rows)} nnz")
              self.feat_tensors.append((ft_rows, ft_cols, ft_vals, n_feat_edges))
  
@@ -667,10 +667,12 @@ index 6d73d2a..1473955 100644
          scheduler = CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=1e-6)
  
 -        best_ari = -1
+-        best_state = None
 +        best_loss = float("inf")
-         best_state = None
++        best_model = None
          patience_counter = 0
          best_epoch = 0
+         dec_initialized = False
 @@ -194,13 +224,22 @@ class DHGNNTrainer:
          print(f"\nTraining DvDHGNN v9b ({n_params:,} params)")
          print(f"  Device: {self.device}, Nodes: {self.n_nodes}, Classes: {self.n_classes}")
@@ -747,10 +749,11 @@ index 6d73d2a..1473955 100644
 -                current_ari = metrics.get("ari", -1)
 -                if current_ari > best_ari:
 -                    best_ari = current_ari
+-                    best_state = copy.deepcopy(model.state_dict())
 +                current_loss = loss_dict["total"]
 +                if current_loss < best_loss - 1e-6:
 +                    best_loss = current_loss
-                     best_state = copy.deepcopy(model.state_dict())
++                    best_model = copy.deepcopy(model)
                      best_epoch = epoch
                      patience_counter = 0
                  else:
@@ -768,7 +771,14 @@ index 6d73d2a..1473955 100644
                          f"{time.time()-t0:.1f}s"
                      )
  
-@@ -273,9 +332,9 @@ class DHGNNTrainer:
+@@ -268,14 +327,14 @@ class DHGNNTrainer:
+                     print(f"Early stopping at epoch {epoch+1}")
+                     break
+ 
+-        if best_state is not None:
+-            model.load_state_dict(best_state)
++        if best_model is not None:
++            model = best_model.to(self.device)
  
          model.eval()
          with torch.no_grad():

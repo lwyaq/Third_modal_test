@@ -216,7 +216,7 @@ class DHGNNTrainer:
         scheduler = CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=1e-6)
 
         best_loss = float("inf")
-        best_state = None
+        best_model = None
         patience_counter = 0
         best_epoch = 0
         dec_initialized = False
@@ -304,7 +304,7 @@ class DHGNNTrainer:
                 current_loss = loss_dict["total"]
                 if current_loss < best_loss - 1e-6:
                     best_loss = current_loss
-                    best_state = copy.deepcopy(model.state_dict())
+                    best_model = copy.deepcopy(model)
                     best_epoch = epoch
                     patience_counter = 0
                 else:
@@ -327,8 +327,8 @@ class DHGNNTrainer:
                     print(f"Early stopping at epoch {epoch+1}")
                     break
 
-        if best_state is not None:
-            model.load_state_dict(best_state)
+        if best_model is not None:
+            model = best_model.to(self.device)
 
         model.eval()
         with torch.no_grad():
