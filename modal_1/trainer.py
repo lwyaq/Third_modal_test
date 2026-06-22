@@ -258,6 +258,14 @@ class DHGNNTrainer:
                 dec_initialized = True
                 init_ari = adjusted_rand_score(self.labels, km.labels_) if self.labels is not None else -1
                 print(f"  KMeans init ARI: {init_ari:.4f}")
+                # Warmup and DEC optimize different objectives; reset loss-based
+                # model selection so DEC checkpoints are not compared against
+                # lower warmup losses that do not include cluster KL.
+                best_loss = float("inf")
+                best_model = None
+                patience_counter = 0
+                best_epoch = epoch
+                print("  Reset best-loss tracking for DEC phase.")
                 model.train()
 
             outputs = self._forward(model, modality_tensors)

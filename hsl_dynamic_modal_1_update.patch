@@ -581,7 +581,7 @@ index b96fd94..4b53083 100644
  
      metrics = trainer.fit()
 diff --git a/modal_1/trainer.py b/modal_1/trainer.py
-index 6d73d2a..dd8f993 100644
+index 6d73d2a..0963592 100644
 --- a/modal_1/trainer.py
 +++ b/modal_1/trainer.py
 @@ -93,6 +93,13 @@ class DHGNNTrainer:
@@ -719,7 +719,7 @@ index 6d73d2a..dd8f993 100644
          print(f"  Warmup: {self.warmup_epochs} → DEC KL")
          print()
  
-@@ -212,7 +251,7 @@ class DHGNNTrainer:
+@@ -212,16 +251,24 @@ class DHGNNTrainer:
                  print(f"\n>>> Warmup complete. Initializing DEC...")
                  model.eval()
                  with torch.no_grad():
@@ -728,8 +728,17 @@ index 6d73d2a..dd8f993 100644
                  km = KMeans(n_clusters=self.n_classes, n_init=20, random_state=self.seed, max_iter=300)
                  km.fit(emb)
                  model.cluster_centers.data.copy_(torch.FloatTensor(km.cluster_centers_).to(self.device))
-@@ -221,7 +260,7 @@ class DHGNNTrainer:
+                 dec_initialized = True
+                 init_ari = adjusted_rand_score(self.labels, km.labels_) if self.labels is not None else -1
                  print(f"  KMeans init ARI: {init_ari:.4f}")
++                # Warmup and DEC optimize different objectives; reset loss-based
++                # model selection so DEC checkpoints are not compared against
++                # lower warmup losses that do not include cluster KL.
++                best_loss = float("inf")
++                best_model = None
++                patience_counter = 0
++                best_epoch = epoch
++                print("  Reset best-loss tracking for DEC phase.")
                  model.train()
  
 -            outputs = self._forward(model, X_tensor)
@@ -737,7 +746,7 @@ index 6d73d2a..dd8f993 100644
              loss, loss_dict = compute_total_loss(
                  outputs, self.sp_rows, self.sp_cols, self.sp_vals,
                  self.n_nodes, self.n_spatial_edges, self.input_dims,
-@@ -238,19 +277,39 @@ class DHGNNTrainer:
+@@ -238,19 +285,39 @@ class DHGNNTrainer:
              optimizer.step()
              scheduler.step()
  
@@ -782,7 +791,7 @@ index 6d73d2a..dd8f993 100644
  
                  phase = "DEC" if dec_initialized else "warmup"
                  if (epoch + 1) % 20 == 0 or epoch == 0:
-@@ -260,7 +319,7 @@ class DHGNNTrainer:
+@@ -260,7 +327,7 @@ class DHGNNTrainer:
                          f"(recon={loss_dict.get('recon', 0):.3f}, "
                          f"clust={loss_dict.get('cluster', 0):.3f}, "
                          f"sm_s={loss_dict.get('smooth_s', 0):.3f}) | "
@@ -791,7 +800,7 @@ index 6d73d2a..dd8f993 100644
                          f"{time.time()-t0:.1f}s"
                      )
  
-@@ -268,14 +327,14 @@ class DHGNNTrainer:
+@@ -268,14 +335,14 @@ class DHGNNTrainer:
                      print(f"Early stopping at epoch {epoch+1}")
                      break
  
@@ -810,7 +819,7 @@ index 6d73d2a..dd8f993 100644
          if "ari" in metrics:
              print(f"Final: ARI={metrics['ari']:.4f}, NMI={metrics['nmi']:.4f}")
  
-@@ -284,8 +343,8 @@ class DHGNNTrainer:
+@@ -284,8 +351,8 @@ class DHGNNTrainer:
          self.predictions = metrics.get("predictions", None)
          return metrics
  
