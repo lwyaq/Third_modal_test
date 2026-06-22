@@ -163,6 +163,27 @@ labels are available, the CSV includes both the final metrics selected by
 unsupervised loss and label-based `best_observed_ari`/`best_observed_epoch` for
 debugging only.
 
+### Recommended 48-run sweep shortcut
+
+`run_sweep_48.py` runs the recommended 48-combination sweep without typing the
+long command:
+
+```bash
+python -m modal_1.run_sweep_48
+```
+
+To check the 48 generated configurations without training:
+
+```bash
+python -m modal_1.run_sweep_48 --dry_run
+```
+
+The shortcut still accepts overrides, for example:
+
+```bash
+python -m modal_1.run_sweep_48 --epochs 300 --output_csv my_sweep.csv
+```
+
 ## Key CLI arguments
 
 | Argument | Meaning |
