@@ -184,6 +184,22 @@ The shortcut still accepts overrides, for example:
 python -m modal_1.run_sweep_48 --epochs 300 --output_csv my_sweep.csv
 ```
 
+### Refined 48-run sweep around run34
+
+`run_sweep_48_refine_run34.py` runs a focused 48-combination local search around
+the best setting observed in the previous sweep (`warmup=120`,
+`lambda_recon=0.45`, `lambda_cluster=4.0`, `topk_edges=8`, `delta_edges=50`):
+
+```bash
+python -m modal_1.run_sweep_48_refine_run34
+```
+
+To check the generated configurations without training:
+
+```bash
+python -m modal_1.run_sweep_48_refine_run34 --dry_run
+```
+
 ## Key CLI arguments
 
 | Argument | Meaning |
