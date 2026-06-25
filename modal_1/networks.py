@@ -111,14 +111,21 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
                  min_edges: int = 100, max_edges: Optional[int] = None):
         super().__init__()
         init = torch.as_tensor(init_node_features, dtype=torch.float32).detach().clone()
-        if init.shape[1] == hidden_dim:
-            prototypes = init
-        else:
-            projection = torch.randn(
-                init.shape[1], hidden_dim, device=init.device, dtype=init.dtype
-            ) / (init.shape[1] ** 0.5)
-            prototypes = init @ projection
-        self.edge_features = nn.Parameter(prototypes)
+        self.raw_dim = init.shape[1]
+        # Keep one learnable raw biological prototype per input cell.  These
+        # prototypes are initialized directly from the preprocessed modality
+        # features (RNA PCA / ATAC LSI), so M0 = N and no hidden embedding or
+        # random Gaussian hyperedge sampling is used at initialization.
+        self.edge_raw_features = nn.Parameter(init)
+        # Map raw biological prototypes into the hidden space used by the node
+        # embeddings only when constructing attention.  The sampled/prototype
+        # state itself remains in the preprocessed biological feature space.
+        self.edge_encoder = nn.Sequential(
+            nn.LayerNorm(self.raw_dim),
+            nn.Linear(self.raw_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+        )
         self.query = nn.Linear(hidden_dim, hidden_dim)
         self.key = nn.Linear(hidden_dim, hidden_dim)
         self.topk_edges = topk_edges
@@ -129,13 +136,14 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
 
     @property
     def n_edges(self) -> int:
-        return int(self.edge_features.shape[0])
+        return int(self.edge_raw_features.shape[0])
 
     def forward(self, node_embeddings):
         n_nodes = node_embeddings.shape[0]
         n_edges = self.n_edges
         k = min(self.topk_edges, n_edges)
-        scores = self.query(node_embeddings) @ self.key(self.edge_features).T
+        edge_hidden = self.edge_encoder(self.edge_raw_features)
+        scores = self.query(node_embeddings) @ self.key(edge_hidden).T
         scores = scores / (node_embeddings.shape[1] ** 0.5)
         attn = torch.softmax(scores, dim=1)
         vals, cols = torch.topk(attn, k=k, dim=1)
@@ -149,7 +157,7 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
 
     @torch.no_grad()
     def adjust_edges(self, beta=0.90, gamma=0.98, delta_edges=20, allow_add=True):
-        device = self.edge_features.device
+        device = self.edge_raw_features.device
         usage = self.last_edge_usage
         n_edges = self.n_edges
         if usage is None:
@@ -161,14 +169,15 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
         if saturation < beta and n_edges > self.min_edges:
             keep_count = max(self.min_edges, n_edges - delta_edges)
             keep_idx = torch.argsort(usage, descending=True)[:keep_count].sort().values
-            self.edge_features = nn.Parameter(self.edge_features.data[keep_idx].clone().to(device))
+            self.edge_raw_features = nn.Parameter(self.edge_raw_features.data[keep_idx].clone().to(device))
             action = "prune"
         elif saturation > gamma and allow_add and n_edges < self.max_edges:
             add_count = min(delta_edges, self.max_edges - n_edges)
             source = torch.randint(0, n_edges, (add_count,), device=device)
-            noise = 0.01 * torch.randn(add_count, self.edge_features.shape[1], device=device)
-            added = self.edge_features.data[source] + noise
-            self.edge_features = nn.Parameter(torch.cat([self.edge_features.data, added], dim=0))
+            scale = self.edge_raw_features.data.std(dim=0, keepdim=True).clamp_min(1e-3)
+            noise = 0.01 * torch.randn(add_count, self.raw_dim, device=device) * scale
+            added = self.edge_raw_features.data[source] + noise
+            self.edge_raw_features = nn.Parameter(torch.cat([self.edge_raw_features.data, added], dim=0))
             action = "add"
         return {"action": action, "saturation": saturation, "empty": empty, "n_edges": self.n_edges}
 

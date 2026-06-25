@@ -68,10 +68,12 @@ The spatial topology is not reconstructed during training.
 ### Dynamic biological feature hypergraphs
 
 `VariableBioDynamicFeatureHypergraph` initializes feature hyperedge prototypes
-from the corresponding modality features. If the modality feature dimension does
-not match `hidden_dim`, a one-time projection is used only to align dimensions.
-The hyperedge prototypes are still derived from the real RNA/ATAC feature
-distribution, not from random Gaussian hyperedges.
+from the corresponding preprocessed modality features (RNA PCA / ATAC LSI).
+The initial number of feature hyperedges is the cell count (`M0 = N`), because
+each cell's preprocessed feature vector is used as one candidate biological
+prototype. The raw prototypes remain in the biological feature space and are
+encoded into `hidden_dim` only when attention is computed; they are not sampled
+from hidden embeddings or random Gaussian hyperedges.
 
 ### Unsupervised objective
 
