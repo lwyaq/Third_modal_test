@@ -99,6 +99,7 @@ class DHGNNTrainer:
         topk_edges=3, min_edges=100, max_edges=None,
         hsl_residual_strength=0.5,
         allow_edge_add=True,
+        freeze_edges_after_warmup=True,
         n_feature_edges=None, k_nodes=None, k_edges=None,
     ):
         self.coords = coords
@@ -139,6 +140,7 @@ class DHGNNTrainer:
         self.max_edges = max_edges or self.n_nodes
         self.hsl_residual_strength = hsl_residual_strength
         self.allow_edge_add = allow_edge_add
+        self.freeze_edges_after_warmup = freeze_edges_after_warmup
 
         self._build_spatial_hypergraph()
         if self.use_dynamic_feature:
@@ -241,7 +243,8 @@ class DHGNNTrainer:
         print(f"  HSL spatial: {self.use_hsl_spatial}; dynamic feature: {self.use_dynamic_feature}")
         print(f"  Edge adjustment: interval={self.edge_adjust_interval}, delta={self.delta_edges}, "
               f"beta={self.beta_saturation}, gamma={self.gamma_saturation}, "
-              f"allow_add={self.allow_edge_add}")
+              f"allow_add={self.allow_edge_add}, "
+              f"freeze_after_warmup={self.freeze_edges_after_warmup}")
         print(f"  Fusion: sigmoid intra-modal gate → sigmoid cross-modal gate")
         print(f"  Warmup: {self.warmup_epochs} → DEC KL")
         print()
@@ -291,7 +294,14 @@ class DHGNNTrainer:
             optimizer.step()
             scheduler.step()
 
-            if self.use_dynamic_feature and self.edge_adjust_interval > 0 and epoch > 0 and epoch % self.edge_adjust_interval == 0:
+            can_adjust_edges = (
+                self.use_dynamic_feature
+                and self.edge_adjust_interval > 0
+                and epoch > 0
+                and epoch % self.edge_adjust_interval == 0
+                and not (self.freeze_edges_after_warmup and dec_initialized)
+            )
+            if can_adjust_edges:
                 edge_logs = model.adjust_dynamic_feature_edges(
                     beta=self.beta_saturation, gamma=self.gamma_saturation,
                     delta_edges=self.delta_edges, allow_add=self.allow_edge_add

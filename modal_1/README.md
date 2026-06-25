@@ -139,6 +139,12 @@ python -m modal_1.run \
   --allow_edge_add
 ```
 
+By default, dynamic feature hyperedge add/prune runs only during warmup.  After
+DEC is initialized, the learned biological hyperedge set is frozen so the DEC
+cluster refinement phase does not keep changing the feature-hypergraph topology.
+Use `--no-freeze_edges_after_warmup` only when you explicitly want the older
+behavior where dynamic edge adjustment continues inside DEC.
+
 ### Parameter sweep
 
 Use `param_sweep.py` to load/preprocess the data once and run a comma-separated
@@ -215,6 +221,7 @@ python -m modal_1.run_sweep_48_refine_run34 --dry_run
 | `--topk_edges` | Number of feature hyperedges each node connects to during dynamic construction. |
 | `--min_edges` | Minimum number of feature hyperedges after pruning. |
 | `--allow_edge_add` / `--no-allow_edge_add` | Allow or forbid feature hyperedge expansion. |
+| `--freeze_edges_after_warmup` / `--no-freeze_edges_after_warmup` | Freeze dynamic feature hyperedge add/prune after DEC starts; enabled by default. |
 | `--hsl_residual_strength` | Residual strength for HSL incidence refinement. |
 | `--warmup_epochs` | Number of reconstruction/smoothness warmup epochs before DEC cluster loss starts. |
 | `--lambda_recon` | Weight for reconstruction loss. |

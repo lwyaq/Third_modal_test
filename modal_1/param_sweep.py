@@ -79,6 +79,7 @@ def parse_args():
     p.add_argument("--use_hsl_spatial", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--use_dynamic_feature", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--allow_edge_add", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--freeze_edges_after_warmup", action=argparse.BooleanOptionalAction, default=True)
 
     # Sweep dimensions. Values are comma-separated lists.
     p.add_argument("--seeds", type=str, default="42")
@@ -211,6 +212,7 @@ def main():
         "topk_edges", "edge_adjust_interval", "delta_edges",
         "beta_saturation", "gamma_saturation", "hsl_residual_strength",
         "use_hsl_spatial", "use_dynamic_feature", "allow_edge_add",
+        "freeze_edges_after_warmup",
     ]
 
     for run_id, cfg in enumerate(grid, start=1):
@@ -228,6 +230,7 @@ def main():
             "use_hsl_spatial": _bool_to_cli(args.use_hsl_spatial),
             "use_dynamic_feature": _bool_to_cli(args.use_dynamic_feature),
             "allow_edge_add": _bool_to_cli(args.allow_edge_add),
+            "freeze_edges_after_warmup": _bool_to_cli(args.freeze_edges_after_warmup),
             **cfg,
         }
 
@@ -262,6 +265,7 @@ def main():
                 max_edges=coords.shape[0],
                 hsl_residual_strength=cfg["hsl_residual_strength"],
                 allow_edge_add=args.allow_edge_add,
+                freeze_edges_after_warmup=args.freeze_edges_after_warmup,
             )
             metrics = trainer.fit()
             for key, value in metrics.items():
