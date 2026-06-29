@@ -53,7 +53,6 @@ def parse_args():
     p.add_argument("--hsl_residual_strength", type=float, default=0.5)
     p.add_argument("--allow_edge_add", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--freeze_edges_after_warmup", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--freeze_hsl_after_warmup", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--dropout", type=float, default=0.3)
 
     p.add_argument("--lr", type=float, default=0.001)
@@ -170,7 +169,6 @@ def main():
         hsl_residual_strength=args.hsl_residual_strength,
         allow_edge_add=args.allow_edge_add,
         freeze_edges_after_warmup=args.freeze_edges_after_warmup,
-        freeze_hsl_after_warmup=args.freeze_hsl_after_warmup,
     )
 
     metrics = trainer.fit()
