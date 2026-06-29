@@ -26,6 +26,8 @@ For each modality m in {RNA, ATAC}:
   2. Feature branch:
      - Initialize dynamic feature hyperedge prototypes from that modality's
        biological feature distribution.
+     - Encode cell nodes and feature hyperedge prototypes with the same
+       modality encoder so attention is computed in one shared hidden space.
      - Build a dynamic feature hypergraph by applying a dense softmax over all
        node-to-hyperedge scores and retaining the top-k incidences.
      - Optionally adjust feature hyperedge count using saturation-guided pruning
@@ -73,8 +75,9 @@ from the corresponding preprocessed modality features (RNA PCA / ATAC LSI).
 The initial number of feature hyperedges is the cell count (`M0 = N`), because
 each cell's preprocessed feature vector is used as one candidate biological
 prototype. The raw prototypes remain in the biological feature space and are
-encoded into `hidden_dim` only when attention is computed; they are not sampled
-from hidden embeddings or random Gaussian hyperedges.
+encoded into `hidden_dim` with the same modality encoder used by cell nodes
+before attention is computed; they are not sampled from hidden embeddings or
+random Gaussian hyperedges, and they no longer use a separate edge-only encoder.
 
 ### Unsupervised objective
 

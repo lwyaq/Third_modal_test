@@ -1,9 +1,9 @@
 diff --git a/modal_1/README.md b/modal_1/README.md
 new file mode 100644
-index 0000000..b91cc73
+index 0000000..efc294b
 --- /dev/null
 +++ b/modal_1/README.md
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,245 @@
 +# HSL-DvDHGNN (`modal_1`)
 +
 +This folder contains the current unsupervised spatial multi-omics model implementation.
@@ -32,6 +32,8 @@ index 0000000..b91cc73
 +  2. Feature branch:
 +     - Initialize dynamic feature hyperedge prototypes from that modality's
 +       biological feature distribution.
++     - Encode cell nodes and feature hyperedge prototypes with the same
++       modality encoder so attention is computed in one shared hidden space.
 +     - Build a dynamic feature hypergraph by applying a dense softmax over all
 +       node-to-hyperedge scores and retaining the top-k incidences.
 +     - Optionally adjust feature hyperedge count using saturation-guided pruning
@@ -79,8 +81,9 @@ index 0000000..b91cc73
 +The initial number of feature hyperedges is the cell count (`M0 = N`), because
 +each cell's preprocessed feature vector is used as one candidate biological
 +prototype. The raw prototypes remain in the biological feature space and are
-+encoded into `hidden_dim` only when attention is computed; they are not sampled
-+from hidden embeddings or random Gaussian hyperedges.
++encoded into `hidden_dim` with the same modality encoder used by cell nodes
++before attention is computed; they are not sampled from hidden embeddings or
++random Gaussian hyperedges, and they no longer use a separate edge-only encoder.
 +
 +### Unsupervised objective
 +
@@ -247,10 +250,10 @@ index 0000000..b91cc73
 +- If `use_dynamic_feature=True`, static feature hypergraph construction is
 +  skipped and feature hypergraphs are generated inside the model during forward.
 diff --git a/modal_1/networks.py b/modal_1/networks.py
-index e661964..ad753ff 100644
+index e661964..47e3e48 100644
 --- a/modal_1/networks.py
 +++ b/modal_1/networks.py
-@@ -67,6 +67,121 @@ class SparseHGNNConv(nn.Module):
+@@ -67,6 +67,123 @@ class SparseHGNNConv(nn.Module):
          return x_out
  
  
@@ -292,7 +295,14 @@ index e661964..ad753ff 100644
 +
 +
 +class VariableBioDynamicFeatureHypergraph(nn.Module):
-+    """Biologically initialized dynamic feature hypergraph with variable edge count."""
++    """Biologically initialized dynamic feature hypergraph with variable edge count.
++
++    The raw biological prototypes stay in the preprocessed modality feature
++    space, but they are encoded by the same modality encoder as cell nodes
++    before attention is computed.  This keeps node embeddings and feature
++    hyperedge prototypes in a shared hidden space instead of using a separate
++    edge-only encoder.
++    """
 +
 +    def __init__(self, init_node_features, hidden_dim: int, topk_edges: int = 3,
 +                 min_edges: int = 100, max_edges: Optional[int] = None):
@@ -304,15 +314,6 @@ index e661964..ad753ff 100644
 +        # features (RNA PCA / ATAC LSI), so M0 = N and no hidden embedding or
 +        # random Gaussian hyperedge sampling is used at initialization.
 +        self.edge_raw_features = nn.Parameter(init)
-+        # Map raw biological prototypes into the hidden space used by the node
-+        # embeddings only when constructing attention.  The sampled/prototype
-+        # state itself remains in the preprocessed biological feature space.
-+        self.edge_encoder = nn.Sequential(
-+            nn.LayerNorm(self.raw_dim),
-+            nn.Linear(self.raw_dim, hidden_dim),
-+            nn.GELU(),
-+            nn.LayerNorm(hidden_dim),
-+        )
 +        self.query = nn.Linear(hidden_dim, hidden_dim)
 +        self.key = nn.Linear(hidden_dim, hidden_dim)
 +        self.topk_edges = topk_edges
@@ -325,12 +326,16 @@ index e661964..ad753ff 100644
 +    def n_edges(self) -> int:
 +        return int(self.edge_raw_features.shape[0])
 +
-+    def forward(self, node_embeddings):
++    def forward(self, node_embeddings, edge_embeddings):
 +        n_nodes = node_embeddings.shape[0]
 +        n_edges = self.n_edges
 +        k = min(self.topk_edges, n_edges)
-+        edge_hidden = self.edge_encoder(self.edge_raw_features)
-+        scores = self.query(node_embeddings) @ self.key(edge_hidden).T
++        if edge_embeddings.shape[0] != n_edges:
++            raise ValueError(
++                f"Expected {n_edges} encoded feature hyperedge prototypes, "
++                f"got {edge_embeddings.shape[0]}"
++            )
++        scores = self.query(node_embeddings) @ self.key(edge_embeddings).T
 +        scores = scores / (node_embeddings.shape[1] ** 0.5)
 +        attn = torch.softmax(scores, dim=1)
 +        vals, cols = torch.topk(attn, k=k, dim=1)
@@ -372,7 +377,7 @@ index e661964..ad753ff 100644
  # ====================================================================== #
  #              Per-Modality Dual-Hypergraph Model (v9b)                   #
  # ====================================================================== #
-@@ -91,11 +206,20 @@ class DualBranchDHGNN(nn.Module):
+@@ -91,11 +208,20 @@ class DualBranchDHGNN(nn.Module):
          n_classes: int = 14,
          n_layers: int = 3,
          dropout: float = 0.2,
@@ -393,7 +398,7 @@ index e661964..ad753ff 100644
  
          # ---- Per-modality encoders ----
          self.encoders = nn.ModuleList()
-@@ -118,6 +242,13 @@ class DualBranchDHGNN(nn.Module):
+@@ -118,6 +244,13 @@ class DualBranchDHGNN(nn.Module):
                  for _ in range(n_layers)
              ]))
  
@@ -407,7 +412,7 @@ index e661964..ad753ff 100644
          # ---- Per-modality feature HGNNs (operate on modality-specific H_feature) ----
          self.feature_convs = nn.ModuleList()
          for _ in range(self.n_modalities):
-@@ -126,25 +257,28 @@ class DualBranchDHGNN(nn.Module):
+@@ -126,25 +259,28 @@ class DualBranchDHGNN(nn.Module):
                  for _ in range(n_layers)
              ]))
  
@@ -445,7 +450,7 @@ index e661964..ad753ff 100644
          self.cluster_centers = Parameter(torch.randn(n_classes, hidden_dim) * 0.01)
  
          # ---- Per-modality decoders ----
-@@ -156,43 +290,74 @@ class DualBranchDHGNN(nn.Module):
+@@ -156,43 +292,84 @@ class DualBranchDHGNN(nn.Module):
                  nn.Linear(hidden_dim, dim),
              ))
  
@@ -498,6 +503,14 @@ index e661964..ad753ff 100644
 -            mod_h.append(self.encoders[i](x[:, offset:offset + d]))
 -            offset += d
 +            mod_h.append(self.encoders[i](x_raw[i]))
++
++        dynamic_edge_h = [None for _ in range(self.n_modalities)]
++        if self.use_dynamic_feature:
++            for i, builder in enumerate(self.dynamic_feature_builders):
++                # Encode biological hyperedge prototypes with the same
++                # modality encoder used for cells, so attention compares
++                # nodes and prototypes in one shared hidden space.
++                dynamic_edge_h[i] = self.encoders[i](builder.edge_raw_features)
  
          # ---- Per-modality dual HGNN message passing ----
          mod_embeddings = []
@@ -526,14 +539,16 @@ index e661964..ad753ff 100644
 -                # Feature conv on modality-specific H_feature
 +                # Feature conv on modality-specific static or dynamic H_feature
 +                if self.use_dynamic_feature:
-+                    ft_rows, ft_cols, ft_vals, n_feat_edges = self.dynamic_feature_builders[m](h_f)
++                    ft_rows, ft_cols, ft_vals, n_feat_edges = self.dynamic_feature_builders[m](
++                        h_f, dynamic_edge_h[m]
++                    )
 +                    dynamic_feat_tensors[m] = (ft_rows, ft_cols, ft_vals, n_feat_edges)
 +                else:
 +                    ft_rows, ft_cols, ft_vals, n_feat_edges = feat_tensors[m]
                  h_f_new = self.feature_convs[m][layer_i](
                      h_f, ft_rows, ft_cols, ft_vals, n_nodes, n_feat_edges
                  )
-@@ -202,7 +367,7 @@ class DualBranchDHGNN(nn.Module):
+@@ -202,7 +379,7 @@ class DualBranchDHGNN(nn.Module):
                      mod_feature_pre.append(h_f_new)
  
                  # Intra-modal fusion
@@ -542,7 +557,7 @@ index e661964..ad753ff 100644
                  merged = gate * h_s_new + (1 - gate) * h_f_new
                  h_s = self.intra_norms[m](merged)
                  h_f = h_s  # share for next layer
-@@ -210,12 +375,10 @@ class DualBranchDHGNN(nn.Module):
+@@ -210,12 +387,10 @@ class DualBranchDHGNN(nn.Module):
              mod_embeddings.append(h_s)
  
          # ---- Cross-modal fusion ----
@@ -556,7 +571,7 @@ index e661964..ad753ff 100644
          dist = torch.sum(
              (embedding.unsqueeze(1) - self.cluster_centers.unsqueeze(0)) ** 2, dim=2
          )
-@@ -225,14 +388,13 @@ class DualBranchDHGNN(nn.Module):
+@@ -225,14 +400,13 @@ class DualBranchDHGNN(nn.Module):
          mod_recons = [self.decoders[i](embedding) for i in range(self.n_modalities)]
  
          return {
@@ -572,7 +587,7 @@ index e661964..ad753ff 100644
          }
  
  
-@@ -271,26 +433,11 @@ def compute_total_loss(
+@@ -271,26 +445,11 @@ def compute_total_loss(
      # Per-modality reconstruction loss
      x_raw = outputs["x_raw"]
      recon_loss = torch.tensor(0.0, device=embedding.device)
@@ -602,7 +617,7 @@ index e661964..ad753ff 100644
  
      # DEC KL loss
      if dec_phase:
-@@ -320,7 +467,6 @@ def compute_total_loss(
+@@ -320,7 +479,6 @@ def compute_total_loss(
  
      total = (
          lambda_recon * recon_loss

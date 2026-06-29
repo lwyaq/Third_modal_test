@@ -105,7 +105,14 @@ class HSLSpatialRefiner(nn.Module):
 
 
 class VariableBioDynamicFeatureHypergraph(nn.Module):
-    """Biologically initialized dynamic feature hypergraph with variable edge count."""
+    """Biologically initialized dynamic feature hypergraph with variable edge count.
+
+    The raw biological prototypes stay in the preprocessed modality feature
+    space, but they are encoded by the same modality encoder as cell nodes
+    before attention is computed.  This keeps node embeddings and feature
+    hyperedge prototypes in a shared hidden space instead of using a separate
+    edge-only encoder.
+    """
 
     def __init__(self, init_node_features, hidden_dim: int, topk_edges: int = 3,
                  min_edges: int = 100, max_edges: Optional[int] = None):
@@ -117,15 +124,6 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
         # features (RNA PCA / ATAC LSI), so M0 = N and no hidden embedding or
         # random Gaussian hyperedge sampling is used at initialization.
         self.edge_raw_features = nn.Parameter(init)
-        # Map raw biological prototypes into the hidden space used by the node
-        # embeddings only when constructing attention.  The sampled/prototype
-        # state itself remains in the preprocessed biological feature space.
-        self.edge_encoder = nn.Sequential(
-            nn.LayerNorm(self.raw_dim),
-            nn.Linear(self.raw_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-        )
         self.query = nn.Linear(hidden_dim, hidden_dim)
         self.key = nn.Linear(hidden_dim, hidden_dim)
         self.topk_edges = topk_edges
@@ -138,12 +136,16 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
     def n_edges(self) -> int:
         return int(self.edge_raw_features.shape[0])
 
-    def forward(self, node_embeddings):
+    def forward(self, node_embeddings, edge_embeddings):
         n_nodes = node_embeddings.shape[0]
         n_edges = self.n_edges
         k = min(self.topk_edges, n_edges)
-        edge_hidden = self.edge_encoder(self.edge_raw_features)
-        scores = self.query(node_embeddings) @ self.key(edge_hidden).T
+        if edge_embeddings.shape[0] != n_edges:
+            raise ValueError(
+                f"Expected {n_edges} encoded feature hyperedge prototypes, "
+                f"got {edge_embeddings.shape[0]}"
+            )
+        scores = self.query(node_embeddings) @ self.key(edge_embeddings).T
         scores = scores / (node_embeddings.shape[1] ** 0.5)
         attn = torch.softmax(scores, dim=1)
         vals, cols = torch.topk(attn, k=k, dim=1)
@@ -331,6 +333,14 @@ class DualBranchDHGNN(nn.Module):
         for i in range(self.n_modalities):
             mod_h.append(self.encoders[i](x_raw[i]))
 
+        dynamic_edge_h = [None for _ in range(self.n_modalities)]
+        if self.use_dynamic_feature:
+            for i, builder in enumerate(self.dynamic_feature_builders):
+                # Encode biological hyperedge prototypes with the same
+                # modality encoder used for cells, so attention compares
+                # nodes and prototypes in one shared hidden space.
+                dynamic_edge_h[i] = self.encoders[i](builder.edge_raw_features)
+
         # ---- Per-modality dual HGNN message passing ----
         mod_embeddings = []
         mod_spatial_pre = []
@@ -354,7 +364,9 @@ class DualBranchDHGNN(nn.Module):
                 )
                 # Feature conv on modality-specific static or dynamic H_feature
                 if self.use_dynamic_feature:
-                    ft_rows, ft_cols, ft_vals, n_feat_edges = self.dynamic_feature_builders[m](h_f)
+                    ft_rows, ft_cols, ft_vals, n_feat_edges = self.dynamic_feature_builders[m](
+                        h_f, dynamic_edge_h[m]
+                    )
                     dynamic_feat_tensors[m] = (ft_rows, ft_cols, ft_vals, n_feat_edges)
                 else:
                     ft_rows, ft_cols, ft_vals, n_feat_edges = feat_tensors[m]
