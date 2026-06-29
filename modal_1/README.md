@@ -146,6 +146,12 @@ cluster refinement phase does not keep changing the feature-hypergraph topology.
 Use `--no-freeze_edges_after_warmup` only when you explicitly want the older
 behavior where dynamic edge adjustment continues inside DEC.
 
+HSL spatial refinement is also trained only during warmup by default.  When DEC
+starts, `--freeze_hsl_after_warmup` freezes the learned spatial incidence
+weights so cluster refinement is not coupled to a drifting spatial reweighting
+module.  Use `--no-freeze_hsl_after_warmup` for ablations where HSL should keep
+updating during DEC.
+
 ### Parameter sweep
 
 Use `param_sweep.py` to load/preprocess the data once and run a comma-separated
@@ -223,6 +229,7 @@ python -m modal_1.run_sweep_48_refine_run34 --dry_run
 | `--min_edges` | Minimum number of feature hyperedges after pruning. |
 | `--allow_edge_add` / `--no-allow_edge_add` | Allow or forbid feature hyperedge expansion. |
 | `--freeze_edges_after_warmup` / `--no-freeze_edges_after_warmup` | Freeze dynamic feature hyperedge add/prune after DEC starts; enabled by default. |
+| `--freeze_hsl_after_warmup` / `--no-freeze_hsl_after_warmup` | Freeze HSL spatial refiner parameters after DEC starts; enabled by default. |
 | `--hsl_residual_strength` | Residual strength for HSL incidence refinement. |
 | `--warmup_epochs` | Number of reconstruction/smoothness warmup epochs before DEC cluster loss starts. |
 | `--lambda_recon` | Weight for reconstruction loss. |

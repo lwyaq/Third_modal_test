@@ -100,6 +100,7 @@ class DHGNNTrainer:
         hsl_residual_strength=0.5,
         allow_edge_add=True,
         freeze_edges_after_warmup=True,
+        freeze_hsl_after_warmup=True,
         n_feature_edges=None, k_nodes=None, k_edges=None,
     ):
         self.coords = coords
@@ -141,12 +142,27 @@ class DHGNNTrainer:
         self.hsl_residual_strength = hsl_residual_strength
         self.allow_edge_add = allow_edge_add
         self.freeze_edges_after_warmup = freeze_edges_after_warmup
+        self.freeze_hsl_after_warmup = freeze_hsl_after_warmup
 
         self._build_spatial_hypergraph()
         if self.use_dynamic_feature:
             self.feat_tensors = None
         else:
             self._build_feature_hypergraphs()
+
+    @staticmethod
+    def _freeze_hsl_spatial_refiners(model):
+        """Freeze HSL modules so DEC refines clusters on a fixed spatial weighting."""
+        frozen = 0
+        if not hasattr(model, "spatial_refiners"):
+            return frozen
+        for refiner_group in model.spatial_refiners:
+            for refiner in refiner_group:
+                for param in refiner.parameters():
+                    if param.requires_grad:
+                        param.requires_grad_(False)
+                        frozen += param.numel()
+        return frozen
 
     def _build_spatial_hypergraph(self):
         print("Building spatial hypergraph (Delaunay-star)...")
@@ -245,6 +261,7 @@ class DHGNNTrainer:
               f"beta={self.beta_saturation}, gamma={self.gamma_saturation}, "
               f"allow_add={self.allow_edge_add}, "
               f"freeze_after_warmup={self.freeze_edges_after_warmup}")
+        print(f"  HSL freeze after warmup: {self.freeze_hsl_after_warmup}")
         print(f"  Fusion: sigmoid intra-modal gate → sigmoid cross-modal gate")
         print(f"  Warmup: {self.warmup_epochs} → DEC KL")
         print()
@@ -275,6 +292,15 @@ class DHGNNTrainer:
                 best_observed_nmi = -1.0
                 best_observed_epoch = epoch
                 print("  Reset best-loss tracking for DEC phase.")
+                if self.use_hsl_spatial and self.freeze_hsl_after_warmup:
+                    n_frozen = self._freeze_hsl_spatial_refiners(model)
+                    optimizer = Adam(
+                        (p for p in model.parameters() if p.requires_grad),
+                        lr=self.lr,
+                        weight_decay=self.weight_decay,
+                    )
+                    scheduler = CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=1e-6)
+                    print(f"  Frozen HSL spatial refiners for DEC phase ({n_frozen:,} params).")
                 model.train()
 
             outputs = self._forward(model, modality_tensors)
