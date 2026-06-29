@@ -26,7 +26,8 @@ For each modality m in {RNA, ATAC}:
   2. Feature branch:
      - Initialize dynamic feature hyperedge prototypes from that modality's
        biological feature distribution.
-     - Build a dynamic feature hypergraph with top-k node-to-hyperedge attention.
+     - Build a dynamic feature hypergraph by selecting top-k node-to-hyperedge
+       logits and normalizing only inside the retained sparse top-k set.
      - Optionally adjust feature hyperedge count using saturation-guided pruning
        and expansion.
 

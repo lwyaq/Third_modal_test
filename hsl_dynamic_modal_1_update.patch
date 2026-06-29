@@ -1,9 +1,9 @@
 diff --git a/modal_1/README.md b/modal_1/README.md
 new file mode 100644
-index 0000000..5c2b0fe
+index 0000000..dd633e1
 --- /dev/null
 +++ b/modal_1/README.md
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,242 @@
 +# HSL-DvDHGNN (`modal_1`)
 +
 +This folder contains the current unsupervised spatial multi-omics model implementation.
@@ -32,7 +32,8 @@ index 0000000..5c2b0fe
 +  2. Feature branch:
 +     - Initialize dynamic feature hyperedge prototypes from that modality's
 +       biological feature distribution.
-+     - Build a dynamic feature hypergraph with top-k node-to-hyperedge attention.
++     - Build a dynamic feature hypergraph by selecting top-k node-to-hyperedge
++       logits and normalizing only inside the retained sparse top-k set.
 +     - Optionally adjust feature hyperedge count using saturation-guided pruning
 +       and expansion.
 +
@@ -246,10 +247,10 @@ index 0000000..5c2b0fe
 +- If `use_dynamic_feature=True`, static feature hypergraph construction is
 +  skipped and feature hypergraphs are generated inside the model during forward.
 diff --git a/modal_1/networks.py b/modal_1/networks.py
-index e661964..ad753ff 100644
+index e661964..0b81485 100644
 --- a/modal_1/networks.py
 +++ b/modal_1/networks.py
-@@ -67,6 +67,121 @@ class SparseHGNNConv(nn.Module):
+@@ -67,6 +67,126 @@ class SparseHGNNConv(nn.Module):
          return x_out
  
  
@@ -331,8 +332,13 @@ index e661964..ad753ff 100644
 +        edge_hidden = self.edge_encoder(self.edge_raw_features)
 +        scores = self.query(node_embeddings) @ self.key(edge_hidden).T
 +        scores = scores / (node_embeddings.shape[1] ** 0.5)
-+        attn = torch.softmax(scores, dim=1)
-+        vals, cols = torch.topk(attn, k=k, dim=1)
++        # Select the best candidate hyperedges from raw logits first, then
++        # normalize only within the selected top-k set.  This makes each
++        # sparse node-to-hyperedge incidence row sum to one over its retained
++        # edges instead of inheriting tiny probabilities from a dense softmax
++        # over every dynamic prototype.
++        top_scores, cols = torch.topk(scores, k=k, dim=1)
++        vals = torch.softmax(top_scores, dim=1)
 +        rows = torch.arange(n_nodes, device=node_embeddings.device).repeat_interleave(k)
 +        cols = cols.reshape(-1)
 +        vals = vals.reshape(-1)
@@ -371,7 +377,7 @@ index e661964..ad753ff 100644
  # ====================================================================== #
  #              Per-Modality Dual-Hypergraph Model (v9b)                   #
  # ====================================================================== #
-@@ -91,11 +206,20 @@ class DualBranchDHGNN(nn.Module):
+@@ -91,11 +211,20 @@ class DualBranchDHGNN(nn.Module):
          n_classes: int = 14,
          n_layers: int = 3,
          dropout: float = 0.2,
@@ -392,7 +398,7 @@ index e661964..ad753ff 100644
  
          # ---- Per-modality encoders ----
          self.encoders = nn.ModuleList()
-@@ -118,6 +242,13 @@ class DualBranchDHGNN(nn.Module):
+@@ -118,6 +247,13 @@ class DualBranchDHGNN(nn.Module):
                  for _ in range(n_layers)
              ]))
  
@@ -406,7 +412,7 @@ index e661964..ad753ff 100644
          # ---- Per-modality feature HGNNs (operate on modality-specific H_feature) ----
          self.feature_convs = nn.ModuleList()
          for _ in range(self.n_modalities):
-@@ -126,25 +257,28 @@ class DualBranchDHGNN(nn.Module):
+@@ -126,25 +262,28 @@ class DualBranchDHGNN(nn.Module):
                  for _ in range(n_layers)
              ]))
  
@@ -444,7 +450,7 @@ index e661964..ad753ff 100644
          self.cluster_centers = Parameter(torch.randn(n_classes, hidden_dim) * 0.01)
  
          # ---- Per-modality decoders ----
-@@ -156,43 +290,74 @@ class DualBranchDHGNN(nn.Module):
+@@ -156,43 +295,74 @@ class DualBranchDHGNN(nn.Module):
                  nn.Linear(hidden_dim, dim),
              ))
  
@@ -532,7 +538,7 @@ index e661964..ad753ff 100644
                  h_f_new = self.feature_convs[m][layer_i](
                      h_f, ft_rows, ft_cols, ft_vals, n_nodes, n_feat_edges
                  )
-@@ -202,7 +367,7 @@ class DualBranchDHGNN(nn.Module):
+@@ -202,7 +372,7 @@ class DualBranchDHGNN(nn.Module):
                      mod_feature_pre.append(h_f_new)
  
                  # Intra-modal fusion
@@ -541,7 +547,7 @@ index e661964..ad753ff 100644
                  merged = gate * h_s_new + (1 - gate) * h_f_new
                  h_s = self.intra_norms[m](merged)
                  h_f = h_s  # share for next layer
-@@ -210,12 +375,10 @@ class DualBranchDHGNN(nn.Module):
+@@ -210,12 +380,10 @@ class DualBranchDHGNN(nn.Module):
              mod_embeddings.append(h_s)
  
          # ---- Cross-modal fusion ----
@@ -555,7 +561,7 @@ index e661964..ad753ff 100644
          dist = torch.sum(
              (embedding.unsqueeze(1) - self.cluster_centers.unsqueeze(0)) ** 2, dim=2
          )
-@@ -225,14 +388,13 @@ class DualBranchDHGNN(nn.Module):
+@@ -225,14 +393,13 @@ class DualBranchDHGNN(nn.Module):
          mod_recons = [self.decoders[i](embedding) for i in range(self.n_modalities)]
  
          return {
@@ -571,7 +577,7 @@ index e661964..ad753ff 100644
          }
  
  
-@@ -271,26 +433,11 @@ def compute_total_loss(
+@@ -271,26 +438,11 @@ def compute_total_loss(
      # Per-modality reconstruction loss
      x_raw = outputs["x_raw"]
      recon_loss = torch.tensor(0.0, device=embedding.device)
@@ -601,7 +607,7 @@ index e661964..ad753ff 100644
  
      # DEC KL loss
      if dec_phase:
-@@ -320,7 +467,6 @@ def compute_total_loss(
+@@ -320,7 +472,6 @@ def compute_total_loss(
  
      total = (
          lambda_recon * recon_loss

@@ -145,8 +145,13 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
         edge_hidden = self.edge_encoder(self.edge_raw_features)
         scores = self.query(node_embeddings) @ self.key(edge_hidden).T
         scores = scores / (node_embeddings.shape[1] ** 0.5)
-        attn = torch.softmax(scores, dim=1)
-        vals, cols = torch.topk(attn, k=k, dim=1)
+        # Select the best candidate hyperedges from raw logits first, then
+        # normalize only within the selected top-k set.  This makes each
+        # sparse node-to-hyperedge incidence row sum to one over its retained
+        # edges instead of inheriting tiny probabilities from a dense softmax
+        # over every dynamic prototype.
+        top_scores, cols = torch.topk(scores, k=k, dim=1)
+        vals = torch.softmax(top_scores, dim=1)
         rows = torch.arange(n_nodes, device=node_embeddings.device).repeat_interleave(k)
         cols = cols.reshape(-1)
         vals = vals.reshape(-1)
