@@ -104,15 +104,7 @@ configured number of checks. It is unsupervised and does not use labels.
 
 Run commands from the repository root.
 
-### Version 1: HSL spatial + static feature hypergraph
-
-```bash
-python -m modal_1.run \
-  --use_hsl_spatial \
-  --no-use_dynamic_feature
-```
-
-### Version 2: HSL spatial + dynamic feature hypergraph with fixed edge count
+### Version 1: HSL spatial + dynamic feature hypergraph with fixed edge count
 
 ```bash
 python -m modal_1.run \
@@ -121,7 +113,7 @@ python -m modal_1.run \
   --edge_adjust_interval 0
 ```
 
-### Version 3: HSL spatial + dynamic feature hypergraph with pruning only
+### Version 2: HSL spatial + dynamic feature hypergraph with pruning only
 
 ```bash
 python -m modal_1.run \
@@ -134,7 +126,7 @@ python -m modal_1.run \
   --no-allow_edge_add
 ```
 
-### Version 4: HSL spatial + dynamic feature hypergraph with add/prune
+### Version 3: HSL spatial + dynamic feature hypergraph with add/prune
 
 ```bash
 python -m modal_1.run \
@@ -223,7 +215,7 @@ python -m modal_1.run_sweep_48_refine_run34 --dry_run
 | Argument | Meaning |
 | --- | --- |
 | `--use_hsl_spatial` / `--no-use_hsl_spatial` | Enable/disable HSL refinement of spatial incidence weights. |
-| `--use_dynamic_feature` / `--no-use_dynamic_feature` | Enable/disable dynamic biological feature hypergraphs. |
+| `--use_dynamic_feature` | Keep dynamic prototype feature hypergraphs enabled; the static gene-as-hyperedge path has been removed. |
 | `--edge_adjust_interval` | Epoch interval for feature hyperedge count adjustment; use `0` for fixed M. |
 | `--delta_edges` | Number of feature hyperedges to add/prune at each adjustment. |
 | `--beta_saturation` | Prune threshold. If saturation is below this value, redundant edges are removed. |
@@ -250,5 +242,5 @@ python -m modal_1.run_sweep_48_refine_run34 --dry_run
   keep computation manageable.
 - Spatial topology is always built outside the network and remains fixed during
   training; HSL only changes the weights.
-- If `use_dynamic_feature=True`, static feature hypergraph construction is
-  skipped and feature hypergraphs are generated inside the model during forward.
+- Dynamic prototype feature hypergraphs are the supported feature branch; the
+  older static gene-as-hyperedge construction path has been removed.

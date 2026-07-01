@@ -43,7 +43,8 @@ def parse_args():
     p.add_argument("--k_nodes", type=int, default=15)
     p.add_argument("--k_edges", type=int, default=8)
     p.add_argument("--use_hsl_spatial", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--use_dynamic_feature", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--use_dynamic_feature", action=argparse.BooleanOptionalAction, default=True,
+                   help="Keep dynamic prototype feature hypergraphs enabled; disabling the removed static gene-as-hyperedge path is unsupported")
     p.add_argument("--edge_adjust_interval", type=int, default=10)
     p.add_argument("--delta_edges", type=int, default=20)
     p.add_argument("--beta_saturation", type=float, default=0.90)

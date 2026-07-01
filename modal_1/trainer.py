@@ -21,7 +21,7 @@ from sklearn.metrics import (
 
 from modal_1.networks import DualBranchDHGNN, compute_total_loss
 from modal_1.hypergraph import (
-    delaunay_star_edges, gene_as_hyperedge, build_incidence,
+    delaunay_star_edges, build_incidence,
     compute_expression_weighted_incidence,
 )
 
@@ -148,11 +148,14 @@ class DHGNNTrainer:
         self.dec_stability_tol = dec_stability_tol
         self.dec_stability_min_epochs = dec_stability_min_epochs
 
+        if not self.use_dynamic_feature:
+            raise ValueError(
+                "Static gene-as-hyperedge feature hypergraphs have been removed; "
+                "use_dynamic_feature must remain True for dynamic prototype feature hypergraphs."
+            )
+
         self._build_spatial_hypergraph()
-        if self.use_dynamic_feature:
-            self.feat_tensors = None
-        else:
-            self._build_feature_hypergraphs()
+        self.feat_tensors = None
 
     def _build_spatial_hypergraph(self):
         print("Building spatial hypergraph (Delaunay-star)...")
@@ -169,29 +172,6 @@ class DHGNNTrainer:
         self.sp_rows, self.sp_cols, self.sp_vals = _incidence_to_sparse_tensors(H_spatial, self.device)
         self.n_spatial_edges = H_spatial.shape[1]
         print(f"  Final: {self.n_spatial_edges} edges, {len(self.sp_rows)} nnz")
-
-    def _build_feature_hypergraphs(self):
-        """Build one gene-as-hyperedge feature hypergraph per modality."""
-        modality_names = ["RNA", "ATAC"]
-        self.feat_tensors = []  # list of (ft_rows, ft_cols, ft_vals, n_feat_edges)
-
-        source_matrices = self.gene_expression_matrices or self.modality_data
-        for i, gene_mat in enumerate(source_matrices):
-            name = modality_names[i] if i < len(modality_names) else f"Modality_{i}"
-            print(f"Building {name} feature hypergraph (static feature-as-hyperedge)...")
-            H_gene, n_genes = gene_as_hyperedge(
-                gene_mat,
-                min_cells_pct=0.05,
-                max_cells_pct=0.40,
-                max_genes=3000,
-                use_expression_weights=True,
-            )
-            print(f"  {name} gene hyperedges: {n_genes}")
-            print(f"  H_gene shape: {H_gene.shape}, nnz={H_gene.nnz}")
-            ft_rows, ft_cols, ft_vals = _incidence_to_sparse_tensors(H_gene, self.device)
-            n_feat_edges = H_gene.shape[1]
-            print(f"  Final: {n_feat_edges} edges, {len(ft_rows)} nnz")
-            self.feat_tensors.append((ft_rows, ft_cols, ft_vals, n_feat_edges))
 
     def _forward(self, model, modality_tensors):
         return model(
@@ -238,12 +218,8 @@ class DHGNNTrainer:
         print(f"\nTraining DvDHGNN v9b ({n_params:,} params)")
         print(f"  Device: {self.device}, Nodes: {self.n_nodes}, Classes: {self.n_classes}")
         for i, dim in enumerate(self.input_dims):
-            if self.use_dynamic_feature:
-                n_feat = model.dynamic_feature_builders[i].n_edges
-                feature_desc = f"dynamic bio-initialized, {n_feat} edges, topk={self.topk_edges}"
-            else:
-                n_feat = self.feat_tensors[i][3] if i < len(self.feat_tensors) else 0
-                feature_desc = f"static gene-as-hyperedge, {n_feat} edges"
+            n_feat = model.dynamic_feature_builders[i].n_edges
+            feature_desc = f"dynamic bio-initialized, {n_feat} edges, topk={self.topk_edges}"
             print(f"  Modality {i}: input_dim={dim}, encoder → {self.hidden_dim}, "
                   f"feature_hypergraph={feature_desc}")
         print(f"  Spatial: {self.n_spatial_edges} edges (shared Delaunay-star)")
@@ -324,14 +300,18 @@ class DHGNNTrainer:
                     beta=self.beta_saturation, gamma=self.gamma_saturation,
                     delta_edges=self.delta_edges, allow_add=self.allow_edge_add
                 )
-                optimizer = Adam(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-                scheduler = CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=1e-6)
+                optim_stats = self._refresh_optimizer_params(optimizer, model)
                 names = ["RNA", "ATAC"]
                 print(f"Epoch {epoch+1} dynamic edge adjustment:")
                 for log in edge_logs:
                     name = names[log["modality"]] if log["modality"] < len(names) else f"Modality_{log['modality']}"
                     print(f"  {name}: action={log['action']}, S={log['saturation']:.3f}, "
                           f"empty={log['empty']}, n_edges={log['n_edges']}")
+                if optim_stats["added"] or optim_stats["removed"]:
+                    print(
+                        f"  Optimizer params refreshed without resetting Adam/scheduler "
+                        f"(added={optim_stats['added']}, removed={optim_stats['removed']})"
+                    )
 
             if self.use_hsl_spatial and ((epoch + 1) % 20 == 0 or epoch == 0):
                 for st in model.hsl_stats()[:2]:
@@ -424,6 +404,35 @@ class DHGNNTrainer:
         self.embeddings = metrics.get("embedding", None)
         self.predictions = metrics.get("predictions", None)
         return metrics
+
+    def _refresh_optimizer_params(self, optimizer, model):
+        """Refresh optimizer parameter references after dynamic edge add/prune.
+
+        Dynamic edge adjustment replaces the learnable raw prototype parameter
+        tensors.  Refreshing the existing optimizer keeps Adam moments and the
+        scheduler state for all unchanged parameters, while new prototype
+        tensors start with fresh optimizer state.
+        """
+        old_params = []
+        for group in optimizer.param_groups:
+            old_params.extend(group["params"])
+        old_param_set = set(old_params)
+        new_params = list(model.parameters())
+        new_param_set = set(new_params)
+
+        for stale_param in list(optimizer.state.keys()):
+            if stale_param not in new_param_set:
+                del optimizer.state[stale_param]
+
+        if optimizer.param_groups:
+            optimizer.param_groups[0]["params"] = new_params
+            for group in optimizer.param_groups[1:]:
+                group["params"] = []
+
+        return {
+            "added": sum(1 for p in new_params if p not in old_param_set),
+            "removed": sum(1 for p in old_params if p not in new_param_set),
+        }
 
     def _dec_assignments(self, model, modality_tensors):
         outputs = self._forward(model, modality_tensors)

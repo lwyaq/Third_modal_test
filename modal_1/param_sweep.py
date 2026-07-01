@@ -81,7 +81,8 @@ def parse_args():
 
     # Boolean switches.
     p.add_argument("--use_hsl_spatial", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--use_dynamic_feature", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--use_dynamic_feature", action=argparse.BooleanOptionalAction, default=True,
+                   help="Keep dynamic prototype feature hypergraphs enabled; disabling the removed static gene-as-hyperedge path is unsupported")
     p.add_argument("--allow_edge_add", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--freeze_edges_after_warmup", action=argparse.BooleanOptionalAction, default=True)
 
