@@ -60,6 +60,12 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=500)
     p.add_argument("--patience", type=int, default=50)
     p.add_argument("--warmup_epochs", type=int, default=80)
+    p.add_argument("--dec_stability_patience", type=int, default=0,
+                   help="Enable DEC assignment stability stopping after this many stable checks; 0 disables it")
+    p.add_argument("--dec_stability_tol", type=float, default=0.005,
+                   help="Maximum fraction of changed DEC assignments considered stable")
+    p.add_argument("--dec_stability_min_epochs", type=int, default=20,
+                   help="Minimum number of DEC epochs before stability stopping can trigger")
 
     p.add_argument("--lambda_recon", type=float, default=0.5)
     p.add_argument("--lambda_cluster", type=float, default=1.0)
@@ -151,6 +157,9 @@ def main():
         epochs=args.epochs,
         patience=args.patience,
         warmup_epochs=args.warmup_epochs,
+        dec_stability_patience=args.dec_stability_patience,
+        dec_stability_tol=args.dec_stability_tol,
+        dec_stability_min_epochs=args.dec_stability_min_epochs,
         seed=args.seed,
         device=device,
         lambda_cluster=args.lambda_cluster,

@@ -100,6 +100,9 @@ class DHGNNTrainer:
         hsl_residual_strength=0.5,
         allow_edge_add=True,
         freeze_edges_after_warmup=True,
+        dec_stability_patience=0,
+        dec_stability_tol=0.005,
+        dec_stability_min_epochs=20,
         n_feature_edges=None, k_nodes=None, k_edges=None,
     ):
         self.coords = coords
@@ -141,6 +144,9 @@ class DHGNNTrainer:
         self.hsl_residual_strength = hsl_residual_strength
         self.allow_edge_add = allow_edge_add
         self.freeze_edges_after_warmup = freeze_edges_after_warmup
+        self.dec_stability_patience = dec_stability_patience
+        self.dec_stability_tol = dec_stability_tol
+        self.dec_stability_min_epochs = dec_stability_min_epochs
 
         self._build_spatial_hypergraph()
         if self.use_dynamic_feature:
@@ -225,6 +231,9 @@ class DHGNNTrainer:
         best_observed_nmi = -1.0
         best_observed_epoch = 0
         dec_initialized = False
+        prev_dec_assignments = None
+        dec_stable_counter = 0
+        last_dec_change = None
 
         print(f"\nTraining DvDHGNN v9b ({n_params:,} params)")
         print(f"  Device: {self.device}, Nodes: {self.n_nodes}, Classes: {self.n_classes}")
@@ -247,6 +256,12 @@ class DHGNNTrainer:
               f"freeze_after_warmup={self.freeze_edges_after_warmup}")
         print(f"  Fusion: sigmoid intra-modal gate → sigmoid cross-modal gate")
         print(f"  Warmup: {self.warmup_epochs} → DEC KL")
+        if self.dec_stability_patience > 0:
+            print(
+                f"  DEC stability stop: patience={self.dec_stability_patience}, "
+                f"tol={self.dec_stability_tol:.4f}, "
+                f"min_dec_epochs={self.dec_stability_min_epochs}"
+            )
         print()
 
         for epoch in range(self.epochs):
@@ -274,6 +289,9 @@ class DHGNNTrainer:
                 best_observed_ari = -1.0
                 best_observed_nmi = -1.0
                 best_observed_epoch = epoch
+                prev_dec_assignments = None
+                dec_stable_counter = 0
+                last_dec_change = None
                 print("  Reset best-loss tracking for DEC phase.")
                 model.train()
 
@@ -340,17 +358,44 @@ class DHGNNTrainer:
                     best_observed_nmi = current_nmi
                     best_observed_epoch = epoch
 
+                if dec_initialized and self.dec_stability_patience > 0:
+                    dec_elapsed = epoch + 1 - self.warmup_epochs
+                    with torch.no_grad():
+                        dec_assignments = self._dec_assignments(model, modality_tensors)
+                    if prev_dec_assignments is not None:
+                        last_dec_change = float(np.mean(dec_assignments != prev_dec_assignments))
+                        if dec_elapsed >= self.dec_stability_min_epochs and last_dec_change <= self.dec_stability_tol:
+                            dec_stable_counter += 1
+                        else:
+                            dec_stable_counter = 0
+                    prev_dec_assignments = dec_assignments
+
                 phase = "DEC" if dec_initialized else "warmup"
                 if (epoch + 1) % 20 == 0 or epoch == 0:
+                    stability_msg = ""
+                    if dec_initialized and self.dec_stability_patience > 0 and last_dec_change is not None:
+                        stability_msg = (
+                            f" | dec_change {last_dec_change:.4f} "
+                            f"({dec_stable_counter}/{self.dec_stability_patience})"
+                        )
                     print(
                         f"Epoch {epoch+1:4d} [{phase:7s}] | "
                         f"Loss {loss_dict['total']:.4f} "
                         f"(recon={loss_dict.get('recon', 0):.3f}, "
                         f"clust={loss_dict.get('cluster', 0):.3f}, "
                         f"sm_s={loss_dict.get('smooth_s', 0):.3f}) | "
-                        f"ARI {current_ari:.4f} | best_loss {best_loss:.4f}@{best_epoch+1} | "
-                        f"{time.time()-t0:.1f}s"
+                        f"ARI {current_ari:.4f} | best_loss {best_loss:.4f}@{best_epoch+1}"
+                        f"{stability_msg} | {time.time()-t0:.1f}s"
                     )
+
+                if dec_initialized and self.dec_stability_patience > 0 and dec_stable_counter >= self.dec_stability_patience:
+                    print(
+                        f"DEC assignment stability stopping at epoch {epoch+1}: "
+                        f"change={last_dec_change:.4f} <= {self.dec_stability_tol:.4f} "
+                        f"for {dec_stable_counter} checks after "
+                        f"{self.dec_stability_min_epochs} DEC epochs"
+                    )
+                    break
 
                 if patience_counter >= self.patience // 5:
                     print(f"Early stopping at epoch {epoch+1}")
@@ -379,6 +424,10 @@ class DHGNNTrainer:
         self.embeddings = metrics.get("embedding", None)
         self.predictions = metrics.get("predictions", None)
         return metrics
+
+    def _dec_assignments(self, model, modality_tensors):
+        outputs = self._forward(model, modality_tensors)
+        return outputs["cluster_logits"].argmax(dim=1).detach().cpu().numpy()
 
     def _evaluate(self, model, modality_tensors):
         outputs = self._forward(model, modality_tensors)

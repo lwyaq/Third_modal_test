@@ -67,6 +67,10 @@ def parse_args():
     p.add_argument("--n_layers", type=int, default=3)
     p.add_argument("--epochs", type=int, default=500)
     p.add_argument("--patience", type=int, default=50)
+    p.add_argument("--dec_stability_patience", type=int, default=0,
+                   help="Enable DEC assignment stability stopping after this many stable checks; 0 disables it")
+    p.add_argument("--dec_stability_tol", type=float, default=0.005)
+    p.add_argument("--dec_stability_min_epochs", type=int, default=20)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--max_spatial_edges", type=int, default=1500)
     p.add_argument("--min_edges", type=int, default=100)
@@ -212,7 +216,8 @@ def main():
         "topk_edges", "edge_adjust_interval", "delta_edges",
         "beta_saturation", "gamma_saturation", "hsl_residual_strength",
         "use_hsl_spatial", "use_dynamic_feature", "allow_edge_add",
-        "freeze_edges_after_warmup",
+        "freeze_edges_after_warmup", "dec_stability_patience",
+        "dec_stability_tol", "dec_stability_min_epochs",
     ]
 
     for run_id, cfg in enumerate(grid, start=1):
@@ -231,6 +236,9 @@ def main():
             "use_dynamic_feature": _bool_to_cli(args.use_dynamic_feature),
             "allow_edge_add": _bool_to_cli(args.allow_edge_add),
             "freeze_edges_after_warmup": _bool_to_cli(args.freeze_edges_after_warmup),
+            "dec_stability_patience": args.dec_stability_patience,
+            "dec_stability_tol": args.dec_stability_tol,
+            "dec_stability_min_epochs": args.dec_stability_min_epochs,
             **cfg,
         }
 
@@ -248,6 +256,9 @@ def main():
                 epochs=args.epochs,
                 patience=args.patience,
                 warmup_epochs=cfg["warmup_epochs"],
+                dec_stability_patience=args.dec_stability_patience,
+                dec_stability_tol=args.dec_stability_tol,
+                dec_stability_min_epochs=args.dec_stability_min_epochs,
                 seed=cfg["seed"],
                 device=device,
                 lambda_recon=cfg["lambda_recon"],

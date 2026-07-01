@@ -93,8 +93,12 @@ There is no supervised or semi-supervised classifier loss.
 
 ### Early stopping
 
-Model selection and early stopping use total training loss improvement, not ARI.
-ARI/NMI are only reported when labels are available.
+Model selection uses total training loss improvement, not ARI. ARI/NMI are only
+reported when labels are available. In addition to loss patience, an optional
+DEC assignment-stability stopping rule can be enabled after warmup. This rule
+tracks the fraction of cells whose DEC cluster assignment changes between
+evaluation checks and stops once that fraction stays below a tolerance for a
+configured number of checks. It is unsupervised and does not use labels.
 
 ## Running experiment variants
 
@@ -173,7 +177,9 @@ python -m modal_1.param_sweep \
 For a quick check of the generated grid without training, add `--dry_run`. When
 labels are available, the CSV includes both the final metrics selected by
 unsupervised loss and label-based `best_observed_ari`/`best_observed_epoch` for
-debugging only.
+debugging only. Use `--dec_stability_patience N` with optional
+`--dec_stability_tol` and `--dec_stability_min_epochs` to add unsupervised DEC
+assignment-stability stopping to sweep runs.
 
 ### Recommended 48-run sweep shortcut
 
@@ -228,6 +234,9 @@ python -m modal_1.run_sweep_48_refine_run34 --dry_run
 | `--freeze_edges_after_warmup` / `--no-freeze_edges_after_warmup` | Freeze dynamic feature hyperedge add/prune after DEC starts; enabled by default. |
 | `--hsl_residual_strength` | Residual strength for HSL incidence refinement. |
 | `--warmup_epochs` | Number of reconstruction/smoothness warmup epochs before DEC cluster loss starts. |
+| `--dec_stability_patience` | Number of consecutive stable DEC assignment checks required to stop; `0` disables this optional rule. |
+| `--dec_stability_tol` | Maximum fraction of changed DEC assignments considered stable. |
+| `--dec_stability_min_epochs` | Minimum number of DEC-phase epochs before assignment-stability stopping can trigger. |
 | `--lambda_recon` | Weight for reconstruction loss. |
 | `--lambda_cluster` | Weight for DEC cluster loss after warmup. |
 | `--lambda_smooth` | Weight for spatial/feature smoothness loss. |
