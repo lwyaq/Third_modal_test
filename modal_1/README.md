@@ -34,7 +34,10 @@ For each modality m in {RNA, ATAC}:
        and expansion.
 
   3. Intra-modal fusion:
-     Z_m = sigmoid(alpha_m) * Z_m_spatial + (1 - sigmoid(alpha_m)) * Z_m_feature
+     - Discrepancy-aware Structure-Feature Attention computes node-wise
+       weights from [Z_m_spatial, Z_m_feature, |Z_m_spatial - Z_m_feature|,
+       Z_m_spatial ⊙ Z_m_feature].
+     - Z_m = alpha_s(v) * Z_m_spatial + alpha_f(v) * Z_m_feature.
 
 Cross-modal fusion:
   Z = sigmoid(beta) * Z_RNA + (1 - sigmoid(beta)) * Z_ATAC
@@ -78,6 +81,21 @@ prototype. The raw prototypes remain in the biological feature space and are
 encoded into `hidden_dim` with the same modality encoder used by cell nodes
 before attention is computed; they are not sampled from hidden embeddings or
 random Gaussian hyperedges, and they no longer use a separate edge-only encoder.
+
+### Discrepancy-aware intra-modal structure/feature fusion
+
+Within each modality, spatial-branch and feature-branch embeddings can agree or
+conflict for different cells.  The intra-modal fusion module therefore predicts
+per-cell structure/feature weights from the two branch embeddings, their
+absolute discrepancy, and their element-wise agreement:
+
+```text
+[h_s, h_f, |h_s - h_f|, h_s ⊙ h_f] -> softmax(alpha_s, alpha_f)
+Z_m(v) = alpha_s(v) * h_s(v) + alpha_f(v) * h_f(v)
+```
+
+This replaces the older modality-level scalar gate with a node-wise
+discrepancy-aware attention mechanism.
 
 ### Unsupervised objective
 

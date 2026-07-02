@@ -230,7 +230,7 @@ class DHGNNTrainer:
               f"beta={self.beta_saturation}, gamma={self.gamma_saturation}, "
               f"allow_add={self.allow_edge_add}, "
               f"freeze_after_warmup={self.freeze_edges_after_warmup}")
-        print(f"  Fusion: sigmoid intra-modal gate → sigmoid cross-modal gate")
+        print(f"  Fusion: discrepancy-aware intra-modal attention → sigmoid cross-modal gate")
         print(f"  Warmup: {self.warmup_epochs} → DEC KL")
         if self.dec_stability_patience > 0:
             print(

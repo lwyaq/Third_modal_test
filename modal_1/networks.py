@@ -104,6 +104,30 @@ class HSLSpatialRefiner(nn.Module):
         return refined
 
 
+class DiscrepancyAwareStructureFeatureAttention(nn.Module):
+    """Node-wise structure/feature branch fusion with discrepancy cues.
+
+    The fusion score sees both branch embeddings, their absolute discrepancy,
+    and their element-wise agreement.  It returns a per-node two-way attention
+    over the spatial-structure branch and the feature-hypergraph branch.
+    """
+
+    def __init__(self, hidden_dim: int, dropout: float = 0.2):
+        super().__init__()
+        self.scorer = nn.Sequential(
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(self, h_s: torch.Tensor, h_f: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        fusion_input = torch.cat([h_s, h_f, torch.abs(h_s - h_f), h_s * h_f], dim=1)
+        alpha = torch.softmax(self.scorer(fusion_input), dim=1)
+        merged = alpha[:, :1] * h_s + alpha[:, 1:] * h_f
+        return merged, alpha
+
+
 class VariableBioDynamicFeatureHypergraph(nn.Module):
     """Biologically initialized dynamic feature hypergraph with variable edge count.
 
@@ -196,7 +220,7 @@ class DualBranchDHGNN(nn.Module):
       - Encoder: x_m -> h_m (hidden_dim)
       - Spatial HGNN: message passing on shared H_spatial
       - Feature HGNN: message passing on modality-specific H_feature_m
-      - Intra-modal fusion: gate * spatial + (1-gate) * feature
+      - Intra-modal fusion: discrepancy-aware structure/feature attention
 
     Cross-modal fusion: gate_rna * h_rna + (1-gate_rna) * h_atac
     """
@@ -268,9 +292,10 @@ class DualBranchDHGNN(nn.Module):
                     feats, hidden_dim, topk_edges=topk_edges, min_edges=min_edges, max_edges=max_edges
                 ))
 
-        # ---- Per-modality intra-modal fusion gates ----
-        self.intra_gates = nn.ParameterList([
-            nn.Parameter(torch.tensor(0.0)) for _ in range(self.n_modalities)
+        # ---- Per-modality discrepancy-aware structure/feature fusion ----
+        self.intra_fusions = nn.ModuleList([
+            DiscrepancyAwareStructureFeatureAttention(hidden_dim, dropout=dropout)
+            for _ in range(self.n_modalities)
         ])
         self.intra_norms = nn.ModuleList([
             nn.LayerNorm(hidden_dim) for _ in range(self.n_modalities)
@@ -378,9 +403,8 @@ class DualBranchDHGNN(nn.Module):
                     mod_spatial_pre.append(h_s_new)
                     mod_feature_pre.append(h_f_new)
 
-                # Intra-modal fusion
-                gate = torch.sigmoid(self.intra_gates[m])
-                merged = gate * h_s_new + (1 - gate) * h_f_new
+                # Intra-modal discrepancy-aware structure/feature attention
+                merged, _ = self.intra_fusions[m](h_s_new, h_f_new)
                 h_s = self.intra_norms[m](merged)
                 h_f = h_s  # share for next layer
 
