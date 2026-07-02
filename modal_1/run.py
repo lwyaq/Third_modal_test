@@ -61,7 +61,7 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=500)
     p.add_argument("--patience", type=int, default=50)
     p.add_argument("--warmup_epochs", type=int, default=80)
-    p.add_argument("--dec_stability_patience", type=int, default=0,
+    p.add_argument("--dec_stability_patience", type=int, default=3,
                    help="Enable DEC assignment stability stopping after this many stable checks; 0 disables it")
     p.add_argument("--dec_stability_tol", type=float, default=0.005,
                    help="Maximum fraction of changed DEC assignments considered stable")
@@ -70,8 +70,8 @@ def parse_args():
 
     p.add_argument("--lambda_recon", type=float, default=0.5)
     p.add_argument("--lambda_cluster", type=float, default=1.0)
-    p.add_argument("--lambda_smooth", type=float, default=0.1)
-    p.add_argument("--max_spatial_edges", type=int, default=1500)
+    p.add_argument("--lambda_smooth", type=float, default=0.001)
+    p.add_argument("--max_spatial_edges", type=int, default=2129)
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto")

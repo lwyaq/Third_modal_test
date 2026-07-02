@@ -233,6 +233,43 @@ To check the generated configurations without training:
 python -m modal_1.run_sweep_48_refine_run34 --dry_run
 ```
 
+
+### Focused 72-run local refinement sweep
+
+`run_sweep_72_local_refine.py` runs the focused 72-combination grid selected
+for the current discrepancy-aware model after observing that stronger
+smoothness (`lambda_smooth=0.05`) can over-regularize this dataset.  The grid
+keeps the full 2129-edge spatial Delaunay-star graph, enables DEC assignment
+stability stopping, and searches the weak-smoothness / warmup / dynamic-edge /
+HSL neighborhood:
+
+```text
+lambda_smooth:          0.005, 0.01, 0.02
+warmup_epochs:          80, 100
+edge_adjust_interval:   10, 20
+beta_saturation:        0.85, 0.90
+hsl_residual_strength:  0.3, 0.5, 0.7
+```
+
+Total combinations: `3 * 2 * 2 * 2 * 3 = 72`.
+
+```bash
+python -m modal_1.run_sweep_72_local_refine
+```
+
+To check the 72 generated configurations without training:
+
+```bash
+python -m modal_1.run_sweep_72_local_refine --dry_run
+```
+
+The shortcut writes to `sweep_72_local_refine.csv` by default and still accepts
+overrides, for example:
+
+```bash
+python -m modal_1.run_sweep_72_local_refine --epochs 300 --output_csv my_sweep.csv
+```
+
 ## Key CLI arguments
 
 | Argument | Meaning |
