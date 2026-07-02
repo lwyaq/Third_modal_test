@@ -21,7 +21,7 @@ from sklearn.metrics import (
 
 from modal_1.networks import DualBranchDHGNN, compute_total_loss
 from modal_1.hypergraph import (
-    delaunay_star_edges, gene_as_hyperedge, build_incidence,
+    delaunay_star_edges, build_incidence,
     compute_expression_weighted_incidence,
 )
 
@@ -93,6 +93,17 @@ class DHGNNTrainer:
         max_spatial_edges=2000,
         gene_expression_matrices=None,
         expression_features=None, expression_weight=True,
+        use_hsl_spatial=True, use_dynamic_feature=True,
+        edge_adjust_interval=10, delta_edges=20,
+        beta_saturation=0.90, gamma_saturation=0.98,
+        topk_edges=3, min_edges=100, max_edges=None,
+        hsl_residual_strength=0.5,
+        allow_edge_add=True,
+        freeze_edges_after_warmup=True,
+        dec_stability_patience=0,
+        dec_stability_tol=0.005,
+        dec_stability_min_epochs=20,
+        n_feature_edges=None, k_nodes=None, k_edges=None,
     ):
         self.coords = coords
         self.modality_data = modality_data
@@ -100,9 +111,9 @@ class DHGNNTrainer:
         self.seed = seed
         self.device = torch.device(device)
 
-        self.X = np.hstack(modality_data).astype(np.float32)
-        self.n_nodes = self.X.shape[0]
-        self.input_dims = [d.shape[1] for d in modality_data]
+        self.modality_data = [np.asarray(d, dtype=np.float32) for d in modality_data]
+        self.n_nodes = self.modality_data[0].shape[0]
+        self.input_dims = [d.shape[1] for d in self.modality_data]
 
         self.n_classes = n_classes or (len(np.unique(labels)) if labels is not None else 14)
         self.hidden_dim = hidden_dim
@@ -121,9 +132,30 @@ class DHGNNTrainer:
         self.gene_expression_matrices = gene_expression_matrices or []
         self.expression_features = expression_features
         self.expression_weight = expression_weight
+        self.use_hsl_spatial = use_hsl_spatial
+        self.use_dynamic_feature = use_dynamic_feature
+        self.edge_adjust_interval = edge_adjust_interval
+        self.delta_edges = delta_edges
+        self.beta_saturation = beta_saturation
+        self.gamma_saturation = gamma_saturation
+        self.topk_edges = topk_edges
+        self.min_edges = min_edges
+        self.max_edges = max_edges or self.n_nodes
+        self.hsl_residual_strength = hsl_residual_strength
+        self.allow_edge_add = allow_edge_add
+        self.freeze_edges_after_warmup = freeze_edges_after_warmup
+        self.dec_stability_patience = dec_stability_patience
+        self.dec_stability_tol = dec_stability_tol
+        self.dec_stability_min_epochs = dec_stability_min_epochs
+
+        if not self.use_dynamic_feature:
+            raise ValueError(
+                "Static gene-as-hyperedge feature hypergraphs have been removed; "
+                "use_dynamic_feature must remain True for dynamic prototype feature hypergraphs."
+            )
 
         self._build_spatial_hypergraph()
-        self._build_feature_hypergraphs()
+        self.feat_tensors = None
 
     def _build_spatial_hypergraph(self):
         print("Building spatial hypergraph (Delaunay-star)...")
@@ -141,67 +173,71 @@ class DHGNNTrainer:
         self.n_spatial_edges = H_spatial.shape[1]
         print(f"  Final: {self.n_spatial_edges} edges, {len(self.sp_rows)} nnz")
 
-    def _build_feature_hypergraphs(self):
-        """Build one gene-as-hyperedge feature hypergraph per modality."""
-        modality_names = ["RNA", "ATAC"]
-        self.feat_tensors = []  # list of (ft_rows, ft_cols, ft_vals, n_feat_edges)
-
-        for i, gene_mat in enumerate(self.gene_expression_matrices):
-            name = modality_names[i] if i < len(modality_names) else f"Modality_{i}"
-            print(f"Building {name} feature hypergraph (gene-as-hyperedge)...")
-            H_gene, n_genes = gene_as_hyperedge(
-                gene_mat,
-                min_cells_pct=0.05,
-                max_cells_pct=0.40,
-                max_genes=3000,
-                use_expression_weights=True,
-            )
-            print(f"  {name} gene hyperedges: {n_genes}")
-            print(f"  H_gene shape: {H_gene.shape}, nnz={H_gene.nnz}")
-            ft_rows, ft_cols, ft_vals = _incidence_to_sparse_tensors(H_gene, self.device)
-            n_feat_edges = H_gene.shape[1]
-            print(f"  Final: {n_feat_edges} edges, {len(ft_rows)} nnz")
-            self.feat_tensors.append((ft_rows, ft_cols, ft_vals, n_feat_edges))
-
-    def _forward(self, model, X_tensor):
+    def _forward(self, model, modality_tensors):
         return model(
-            X_tensor,
+            modality_tensors,
             self.sp_rows, self.sp_cols, self.sp_vals, self.n_spatial_edges,
             self.feat_tensors,
         )
 
     def fit(self):
-        X_tensor = torch.FloatTensor(self.X).to(self.device)
+        modality_tensors = [torch.FloatTensor(feats).to(self.device) for feats in self.modality_data]
 
+        init_edge_features = modality_tensors
         model = DualBranchDHGNN(
             input_dims=self.input_dims,
             hidden_dim=self.hidden_dim,
             n_classes=self.n_classes,
             n_layers=self.n_layers,
             dropout=self.dropout,
+            init_edge_features=init_edge_features if self.use_dynamic_feature else None,
+            use_hsl_spatial=self.use_hsl_spatial,
+            use_dynamic_feature=self.use_dynamic_feature,
+            topk_edges=self.topk_edges,
+            min_edges=self.min_edges,
+            max_edges=self.max_edges,
+            hsl_residual_strength=self.hsl_residual_strength,
         ).to(self.device)
 
         n_params = sum(p.numel() for p in model.parameters())
         optimizer = Adam(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         scheduler = CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=1e-6)
 
-        best_ari = -1
-        best_state = None
+        best_loss = float("inf")
+        best_model = None
         patience_counter = 0
         best_epoch = 0
+        best_observed_ari = -1.0
+        best_observed_nmi = -1.0
+        best_observed_epoch = 0
         dec_initialized = False
+        prev_dec_assignments = None
+        dec_stable_counter = 0
+        last_dec_change = None
 
         print(f"\nTraining DvDHGNN v9b ({n_params:,} params)")
         print(f"  Device: {self.device}, Nodes: {self.n_nodes}, Classes: {self.n_classes}")
         for i, dim in enumerate(self.input_dims):
-            n_feat = self.feat_tensors[i][3] if i < len(self.feat_tensors) else 0
+            n_feat = model.dynamic_feature_builders[i].n_edges
+            feature_desc = f"dynamic bio-initialized, {n_feat} edges, topk={self.topk_edges}"
             print(f"  Modality {i}: input_dim={dim}, encoder → {self.hidden_dim}, "
-                  f"feature_hypergraph={n_feat} edges")
+                  f"feature_hypergraph={feature_desc}")
         print(f"  Spatial: {self.n_spatial_edges} edges (shared Delaunay-star)")
         print(f"  Losses: recon({self.lambda_recon}) + cluster({self.lambda_cluster}) "
               f"+ smooth({self.lambda_smooth})")
-        print(f"  Fusion: intra-modal gate → cross-modal gate")
+        print(f"  HSL spatial: {self.use_hsl_spatial}; dynamic feature: {self.use_dynamic_feature}")
+        print(f"  Edge adjustment: interval={self.edge_adjust_interval}, delta={self.delta_edges}, "
+              f"beta={self.beta_saturation}, gamma={self.gamma_saturation}, "
+              f"allow_add={self.allow_edge_add}, "
+              f"freeze_after_warmup={self.freeze_edges_after_warmup}")
+        print(f"  Fusion: discrepancy-aware intra-modal attention → sigmoid cross-modal gate")
         print(f"  Warmup: {self.warmup_epochs} → DEC KL")
+        if self.dec_stability_patience > 0:
+            print(
+                f"  DEC stability stop: patience={self.dec_stability_patience}, "
+                f"tol={self.dec_stability_tol:.4f}, "
+                f"min_dec_epochs={self.dec_stability_min_epochs}"
+            )
         print()
 
         for epoch in range(self.epochs):
@@ -212,16 +248,30 @@ class DHGNNTrainer:
                 print(f"\n>>> Warmup complete. Initializing DEC...")
                 model.eval()
                 with torch.no_grad():
-                    emb = self._forward(model, X_tensor)["embedding"].cpu().numpy()
+                    emb = self._forward(model, modality_tensors)["embedding"].cpu().numpy()
                 km = KMeans(n_clusters=self.n_classes, n_init=20, random_state=self.seed, max_iter=300)
                 km.fit(emb)
                 model.cluster_centers.data.copy_(torch.FloatTensor(km.cluster_centers_).to(self.device))
                 dec_initialized = True
                 init_ari = adjusted_rand_score(self.labels, km.labels_) if self.labels is not None else -1
                 print(f"  KMeans init ARI: {init_ari:.4f}")
+                # Warmup and DEC optimize different objectives; reset loss-based
+                # model selection so DEC checkpoints are not compared against
+                # lower warmup losses that do not include cluster KL.
+                best_loss = float("inf")
+                best_model = None
+                patience_counter = 0
+                best_epoch = epoch
+                best_observed_ari = -1.0
+                best_observed_nmi = -1.0
+                best_observed_epoch = epoch
+                prev_dec_assignments = None
+                dec_stable_counter = 0
+                last_dec_change = None
+                print("  Reset best-loss tracking for DEC phase.")
                 model.train()
 
-            outputs = self._forward(model, X_tensor)
+            outputs = self._forward(model, modality_tensors)
             loss, loss_dict = compute_total_loss(
                 outputs, self.sp_rows, self.sp_cols, self.sp_vals,
                 self.n_nodes, self.n_spatial_edges, self.input_dims,
@@ -238,54 +288,158 @@ class DHGNNTrainer:
             optimizer.step()
             scheduler.step()
 
+            can_adjust_edges = (
+                self.use_dynamic_feature
+                and self.edge_adjust_interval > 0
+                and epoch > 0
+                and epoch % self.edge_adjust_interval == 0
+                and not (self.freeze_edges_after_warmup and dec_initialized)
+            )
+            if can_adjust_edges:
+                edge_logs = model.adjust_dynamic_feature_edges(
+                    beta=self.beta_saturation, gamma=self.gamma_saturation,
+                    delta_edges=self.delta_edges, allow_add=self.allow_edge_add
+                )
+                optim_stats = self._refresh_optimizer_params(optimizer, model)
+                names = ["RNA", "ATAC"]
+                print(f"Epoch {epoch+1} dynamic edge adjustment:")
+                for log in edge_logs:
+                    name = names[log["modality"]] if log["modality"] < len(names) else f"Modality_{log['modality']}"
+                    print(f"  {name}: action={log['action']}, S={log['saturation']:.3f}, "
+                          f"empty={log['empty']}, n_edges={log['n_edges']}")
+                if optim_stats["added"] or optim_stats["removed"]:
+                    print(
+                        f"  Optimizer params refreshed without resetting Adam/scheduler "
+                        f"(added={optim_stats['added']}, removed={optim_stats['removed']})"
+                    )
+
+            if self.use_hsl_spatial and ((epoch + 1) % 20 == 0 or epoch == 0):
+                for st in model.hsl_stats()[:2]:
+                    print(f"  HSL m{st['modality']} layer{st['layer']}: "
+                          f"min={st['min']:.4f}, max={st['max']:.4f}, mean={st['mean']:.4f}")
+
             if (epoch + 1) % 5 == 0 or epoch == 0:
                 model.eval()
                 with torch.no_grad():
-                    metrics = self._evaluate(model, X_tensor)
+                    metrics = self._evaluate(model, modality_tensors)
 
-                current_ari = metrics.get("ari", -1)
-                if current_ari > best_ari:
-                    best_ari = current_ari
-                    best_state = copy.deepcopy(model.state_dict())
+                current_loss = loss_dict["total"]
+                if current_loss < best_loss - 1e-6:
+                    best_loss = current_loss
+                    best_model = copy.deepcopy(model)
                     best_epoch = epoch
                     patience_counter = 0
                 else:
                     patience_counter += 1
+                current_ari = metrics.get("ari", -1)
+                current_nmi = metrics.get("nmi", -1)
+                if self.labels is not None and current_ari > best_observed_ari:
+                    best_observed_ari = current_ari
+                    best_observed_nmi = current_nmi
+                    best_observed_epoch = epoch
+
+                if dec_initialized and self.dec_stability_patience > 0:
+                    dec_elapsed = epoch + 1 - self.warmup_epochs
+                    with torch.no_grad():
+                        dec_assignments = self._dec_assignments(model, modality_tensors)
+                    if prev_dec_assignments is not None:
+                        last_dec_change = float(np.mean(dec_assignments != prev_dec_assignments))
+                        if dec_elapsed >= self.dec_stability_min_epochs and last_dec_change <= self.dec_stability_tol:
+                            dec_stable_counter += 1
+                        else:
+                            dec_stable_counter = 0
+                    prev_dec_assignments = dec_assignments
 
                 phase = "DEC" if dec_initialized else "warmup"
                 if (epoch + 1) % 20 == 0 or epoch == 0:
+                    stability_msg = ""
+                    if dec_initialized and self.dec_stability_patience > 0 and last_dec_change is not None:
+                        stability_msg = (
+                            f" | dec_change {last_dec_change:.4f} "
+                            f"({dec_stable_counter}/{self.dec_stability_patience})"
+                        )
                     print(
                         f"Epoch {epoch+1:4d} [{phase:7s}] | "
                         f"Loss {loss_dict['total']:.4f} "
                         f"(recon={loss_dict.get('recon', 0):.3f}, "
                         f"clust={loss_dict.get('cluster', 0):.3f}, "
                         f"sm_s={loss_dict.get('smooth_s', 0):.3f}) | "
-                        f"ARI {current_ari:.4f} (best {best_ari:.4f}@{best_epoch+1}) | "
-                        f"{time.time()-t0:.1f}s"
+                        f"ARI {current_ari:.4f} | best_loss {best_loss:.4f}@{best_epoch+1}"
+                        f"{stability_msg} | {time.time()-t0:.1f}s"
                     )
+
+                if dec_initialized and self.dec_stability_patience > 0 and dec_stable_counter >= self.dec_stability_patience:
+                    print(
+                        f"DEC assignment stability stopping at epoch {epoch+1}: "
+                        f"change={last_dec_change:.4f} <= {self.dec_stability_tol:.4f} "
+                        f"for {dec_stable_counter} checks after "
+                        f"{self.dec_stability_min_epochs} DEC epochs"
+                    )
+                    break
 
                 if patience_counter >= self.patience // 5:
                     print(f"Early stopping at epoch {epoch+1}")
                     break
 
-        if best_state is not None:
-            model.load_state_dict(best_state)
+        if best_model is not None:
+            model = best_model.to(self.device)
 
         model.eval()
         with torch.no_grad():
-            metrics = self._evaluate(model, X_tensor)
+            metrics = self._evaluate(model, modality_tensors)
 
-        print(f"\nBest ARI: {best_ari:.4f} at epoch {best_epoch+1}")
+        print(f"\nBest loss: {best_loss:.4f} at epoch {best_epoch+1}")
         if "ari" in metrics:
             print(f"Final: ARI={metrics['ari']:.4f}, NMI={metrics['nmi']:.4f}")
+            metrics["best_observed_ari"] = best_observed_ari
+            metrics["best_observed_nmi"] = best_observed_nmi
+            metrics["best_observed_epoch"] = best_observed_epoch + 1
+            print(
+                f"Best observed ARI during training: {best_observed_ari:.4f} "
+                f"at epoch {best_observed_epoch+1} "
+                f"(NMI={best_observed_nmi:.4f}; label-based report only)"
+            )
 
         self.model = model
         self.embeddings = metrics.get("embedding", None)
         self.predictions = metrics.get("predictions", None)
         return metrics
 
-    def _evaluate(self, model, X_tensor):
-        outputs = self._forward(model, X_tensor)
+    def _refresh_optimizer_params(self, optimizer, model):
+        """Refresh optimizer parameter references after dynamic edge add/prune.
+
+        Dynamic edge adjustment replaces the learnable raw prototype parameter
+        tensors.  Refreshing the existing optimizer keeps Adam moments and the
+        scheduler state for all unchanged parameters, while new prototype
+        tensors start with fresh optimizer state.
+        """
+        old_params = []
+        for group in optimizer.param_groups:
+            old_params.extend(group["params"])
+        old_param_set = set(old_params)
+        new_params = list(model.parameters())
+        new_param_set = set(new_params)
+
+        for stale_param in list(optimizer.state.keys()):
+            if stale_param not in new_param_set:
+                del optimizer.state[stale_param]
+
+        if optimizer.param_groups:
+            optimizer.param_groups[0]["params"] = new_params
+            for group in optimizer.param_groups[1:]:
+                group["params"] = []
+
+        return {
+            "added": sum(1 for p in new_params if p not in old_param_set),
+            "removed": sum(1 for p in old_params if p not in new_param_set),
+        }
+
+    def _dec_assignments(self, model, modality_tensors):
+        outputs = self._forward(model, modality_tensors)
+        return outputs["cluster_logits"].argmax(dim=1).detach().cpu().numpy()
+
+    def _evaluate(self, model, modality_tensors):
+        outputs = self._forward(model, modality_tensors)
         embedding = outputs["embedding"].cpu().numpy()
         km = KMeans(n_clusters=self.n_classes, n_init=20, random_state=self.seed, max_iter=500)
         predictions = km.fit_predict(embedding)
