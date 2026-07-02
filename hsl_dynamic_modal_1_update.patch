@@ -1,9 +1,9 @@
 diff --git a/modal_1/README.md b/modal_1/README.md
 new file mode 100644
-index 0000000..f2b789e
+index 0000000..f096064
 --- /dev/null
 +++ b/modal_1/README.md
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,267 @@
 +# HSL-DvDHGNN (`modal_1`)
 +
 +This folder contains the current unsupervised spatial multi-omics model implementation.
@@ -101,7 +101,10 @@ index 0000000..f2b789e
 +```
 +
 +This replaces the older modality-level scalar gate with a node-wise
-+discrepancy-aware attention mechanism.
++discrepancy-aware attention mechanism.  Spatial and feature branch streams stay
++separate across stacked HGNN layers; the fused representation is used as the
++modality output and is not fed back into both branches, preserving the
++structure/feature discrepancy signal for the next layer.
 +
 +### Unsupervised objective
 +
@@ -361,7 +364,7 @@ index 3945f1f..7632375 100644
      """Estimate DBSCAN eps via the k-distance knee heuristic."""
      nn = NearestNeighbors(n_neighbors=k + 1, n_jobs=-1)
 diff --git a/modal_1/networks.py b/modal_1/networks.py
-index e661964..ab22b3d 100644
+index e661964..d6c879b 100644
 --- a/modal_1/networks.py
 +++ b/modal_1/networks.py
 @@ -67,6 +67,147 @@ class SparseHGNNConv(nn.Module):
@@ -597,7 +600,7 @@ index e661964..ab22b3d 100644
          self.cluster_centers = Parameter(torch.randn(n_classes, hidden_dim) * 0.01)
 
          # ---- Per-modality decoders ----
-@@ -156,43 +317,84 @@ class DualBranchDHGNN(nn.Module):
+@@ -156,43 +317,85 @@ class DualBranchDHGNN(nn.Module):
                  nn.Linear(hidden_dim, dim),
              ))
 
@@ -669,6 +672,7 @@ index e661964..ab22b3d 100644
 -            ft_rows, ft_cols, ft_vals, n_feat_edges = feat_tensors[m]
              h_s = mod_h[m]
              h_f = mod_h[m]
++            h_m = mod_h[m]
 
              for layer_i in range(self.n_layers):
 -                # Spatial conv on shared H_spatial
@@ -695,19 +699,29 @@ index e661964..ab22b3d 100644
                  h_f_new = self.feature_convs[m][layer_i](
                      h_f, ft_rows, ft_cols, ft_vals, n_nodes, n_feat_edges
                  )
-@@ -201,21 +403,18 @@ class DualBranchDHGNN(nn.Module):
+@@ -201,21 +404,25 @@ class DualBranchDHGNN(nn.Module):
                      mod_spatial_pre.append(h_s_new)
                      mod_feature_pre.append(h_f_new)
 
 -                # Intra-modal fusion
 -                gate = self.intra_gates[m]
 -                merged = gate * h_s_new + (1 - gate) * h_f_new
+-                h_s = self.intra_norms[m](merged)
+-                h_f = h_s  # share for next layer
 +                # Intra-modal discrepancy-aware structure/feature attention
 +                merged, _ = self.intra_fusions[m](h_s_new, h_f_new)
-                 h_s = self.intra_norms[m](merged)
-                 h_f = h_s  # share for next layer
++                h_m = self.intra_norms[m](merged)
++
++                # Keep the two branch streams independent across layers.  The
++                # fused representation is used as the modality output, but it is
++                # not fed back into both branches; otherwise the next layer would
++                # start from identical spatial/feature states and erase the
++                # discrepancy signal this attention is meant to model.
++                h_s = h_s_new
++                h_f = h_f_new
 
-             mod_embeddings.append(h_s)
+-            mod_embeddings.append(h_s)
++            mod_embeddings.append(h_m)
 
          # ---- Cross-modal fusion ----
 -        gate = self.cross_gate
@@ -720,7 +734,7 @@ index e661964..ab22b3d 100644
          dist = torch.sum(
              (embedding.unsqueeze(1) - self.cluster_centers.unsqueeze(0)) ** 2, dim=2
          )
-@@ -225,14 +424,13 @@ class DualBranchDHGNN(nn.Module):
+@@ -225,14 +432,13 @@ class DualBranchDHGNN(nn.Module):
          mod_recons = [self.decoders[i](embedding) for i in range(self.n_modalities)]
 
          return {
@@ -736,7 +750,7 @@ index e661964..ab22b3d 100644
          }
 
 
-@@ -271,26 +469,11 @@ def compute_total_loss(
+@@ -271,26 +477,11 @@ def compute_total_loss(
      # Per-modality reconstruction loss
      x_raw = outputs["x_raw"]
      recon_loss = torch.tensor(0.0, device=embedding.device)
@@ -766,7 +780,7 @@ index e661964..ab22b3d 100644
 
      # DEC KL loss
      if dec_phase:
-@@ -320,7 +503,6 @@ def compute_total_loss(
+@@ -320,7 +511,6 @@ def compute_total_loss(
 
      total = (
          lambda_recon * recon_loss

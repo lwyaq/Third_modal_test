@@ -375,6 +375,7 @@ class DualBranchDHGNN(nn.Module):
         for m in range(self.n_modalities):
             h_s = mod_h[m]
             h_f = mod_h[m]
+            h_m = mod_h[m]
 
             for layer_i in range(self.n_layers):
                 # Spatial conv on shared H_spatial with optional HSL incidence refinement
@@ -405,10 +406,17 @@ class DualBranchDHGNN(nn.Module):
 
                 # Intra-modal discrepancy-aware structure/feature attention
                 merged, _ = self.intra_fusions[m](h_s_new, h_f_new)
-                h_s = self.intra_norms[m](merged)
-                h_f = h_s  # share for next layer
+                h_m = self.intra_norms[m](merged)
 
-            mod_embeddings.append(h_s)
+                # Keep the two branch streams independent across layers.  The
+                # fused representation is used as the modality output, but it is
+                # not fed back into both branches; otherwise the next layer would
+                # start from identical spatial/feature states and erase the
+                # discrepancy signal this attention is meant to model.
+                h_s = h_s_new
+                h_f = h_f_new
+
+            mod_embeddings.append(h_m)
 
         # ---- Cross-modal fusion ----
         gate = torch.sigmoid(self.cross_gate)

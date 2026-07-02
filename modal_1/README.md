@@ -95,7 +95,10 @@ Z_m(v) = alpha_s(v) * h_s(v) + alpha_f(v) * h_f(v)
 ```
 
 This replaces the older modality-level scalar gate with a node-wise
-discrepancy-aware attention mechanism.
+discrepancy-aware attention mechanism.  Spatial and feature branch streams stay
+separate across stacked HGNN layers; the fused representation is used as the
+modality output and is not fed back into both branches, preserving the
+structure/feature discrepancy signal for the next layer.
 
 ### Unsupervised objective
 
