@@ -109,11 +109,13 @@ class DiscrepancyAwareStructureFeatureAttention(nn.Module):
 
     The fusion score sees both branch embeddings, their absolute discrepancy,
     and their element-wise agreement.  It returns a per-node two-way attention
-    over the spatial-structure branch and the feature-hypergraph branch.
+    over the spatial-structure branch and the feature-hypergraph branch, plus a
+    weak average-view residual to avoid prematurely suppressing either view.
     """
 
-    def __init__(self, hidden_dim: int, dropout: float = 0.2):
+    def __init__(self, hidden_dim: int, dropout: float = 0.2, residual_strength: float = 0.1):
         super().__init__()
+        self.residual_strength = residual_strength
         self.scorer = nn.Sequential(
             nn.Linear(hidden_dim * 4, hidden_dim),
             nn.GELU(),
@@ -124,7 +126,9 @@ class DiscrepancyAwareStructureFeatureAttention(nn.Module):
     def forward(self, h_s: torch.Tensor, h_f: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         fusion_input = torch.cat([h_s, h_f, torch.abs(h_s - h_f), h_s * h_f], dim=1)
         alpha = torch.softmax(self.scorer(fusion_input), dim=1)
-        merged = alpha[:, :1] * h_s + alpha[:, 1:] * h_f
+        attention_mix = alpha[:, :1] * h_s + alpha[:, 1:] * h_f
+        residual = 0.5 * (h_s + h_f)
+        merged = attention_mix + self.residual_strength * residual
         return merged, alpha
 
 
@@ -375,7 +379,6 @@ class DualBranchDHGNN(nn.Module):
         for m in range(self.n_modalities):
             h_s = mod_h[m]
             h_f = mod_h[m]
-            h_m = mod_h[m]
 
             for layer_i in range(self.n_layers):
                 # Spatial conv on shared H_spatial with optional HSL incidence refinement
@@ -400,22 +403,17 @@ class DualBranchDHGNN(nn.Module):
                     h_f, ft_rows, ft_cols, ft_vals, n_nodes, n_feat_edges
                 )
 
-                if layer_i == self.n_layers - 1:
-                    mod_spatial_pre.append(h_s_new)
-                    mod_feature_pre.append(h_f_new)
-
-                # Intra-modal discrepancy-aware structure/feature attention
-                merged, _ = self.intra_fusions[m](h_s_new, h_f_new)
-                h_m = self.intra_norms[m](merged)
-
-                # Keep the two branch streams independent across layers.  The
-                # fused representation is used as the modality output, but it is
-                # not fed back into both branches; otherwise the next layer would
-                # start from identical spatial/feature states and erase the
-                # discrepancy signal this attention is meant to model.
+                # Keep the two branch streams independent across layers so
+                # spatial/feature discrepancies are preserved until the final
+                # modality-level fusion.
                 h_s = h_s_new
                 h_f = h_f_new
 
+            mod_spatial_pre.append(h_s)
+            mod_feature_pre.append(h_f)
+            # Fuse once after all stacked HGNN layers, using final branch states.
+            merged, _ = self.intra_fusions[m](h_s, h_f)
+            h_m = self.intra_norms[m](merged)
             mod_embeddings.append(h_m)
 
         # ---- Cross-modal fusion ----

@@ -91,14 +91,16 @@ absolute discrepancy, and their element-wise agreement:
 
 ```text
 [h_s, h_f, |h_s - h_f|, h_s ⊙ h_f] -> softmax(alpha_s, alpha_f)
-Z_m(v) = alpha_s(v) * h_s(v) + alpha_f(v) * h_f(v)
+Z_m(v) = Norm(alpha_s(v) * h_s(v) + alpha_f(v) * h_f(v)
+              + lambda_r * (h_s(v) + h_f(v)) / 2)
 ```
 
 This replaces the older modality-level scalar gate with a node-wise
 discrepancy-aware attention mechanism.  Spatial and feature branch streams stay
-separate across stacked HGNN layers; the fused representation is used as the
-modality output and is not fed back into both branches, preserving the
-structure/feature discrepancy signal for the next layer.
+separate across stacked HGNN layers, then fuse once after the final layer.  The
+weak residual term keeps both views available during fusion and reduces the risk
+that the attention module suppresses either the spatial or feature view too
+early.
 
 ### Unsupervised objective
 
