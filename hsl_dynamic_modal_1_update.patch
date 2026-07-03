@@ -1,9 +1,9 @@
 diff --git a/modal_1/README.md b/modal_1/README.md
 new file mode 100644
-index 0000000..50a8932
+index 0000000..64c12b9
 --- /dev/null
 +++ b/modal_1/README.md
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,315 @@
 +# HSL-DvDHGNN (`modal_1`)
 +
 +This folder contains the current unsupervised spatial multi-omics model implementation.
@@ -26,8 +26,10 @@ index 0000000..50a8932
 +For each modality m in {RNA, ATAC}:
 +  1. Spatial branch:
 +     - Use the fixed Delaunay-star spatial topology.
-+     - Apply HSLSpatialRefiner to learn incidence weights only.
-+     - Do not add or remove spatial hyperedges.
++     - Apply HSLSpatialRefiner once on the shallow modality representation to
++       learn refined incidence weights only.
++     - Reuse the refined spatial incidence values across all stacked spatial
++       HGNN layers; do not add or remove spatial hyperedges.
 +
 +  2. Feature branch:
 +     - Initialize dynamic feature hyperedge prototypes from that modality's
@@ -69,13 +71,17 @@ index 0000000..50a8932
 +### HSL spatial refinement
 +
 +`HSLSpatialRefiner` refines only the incidence values of the fixed spatial
-+hypergraph:
++hypergraph.  For each modality, HSL is computed once from the shallow encoded
++representation and the resulting refined incidence values are shared by all
++stacked spatial HGNN layers:
 +
 +```text
-+H_spatial_refined = H_spatial^0 ⊙ G_theta(Z_m)
++H_spatial_refined = H_spatial^0 ⊙ G_theta(Z_m^(0))
++H_s,m^(l+1) = SHGNN^(l)(H_s,m^(l), H_spatial_refined)
 +```
 +
-+The spatial topology is not reconstructed during training.
++The spatial topology is not reconstructed during training, and later spatial
++layers do not recalculate separate HSL weights.
 +
 +### Dynamic biological feature hypergraphs
 +
@@ -406,7 +412,7 @@ index 3945f1f..7632375 100644
      """Estimate DBSCAN eps via the k-distance knee heuristic."""
      nn = NearestNeighbors(n_neighbors=k + 1, n_jobs=-1)
 diff --git a/modal_1/networks.py b/modal_1/networks.py
-index e661964..8fdf3ad 100644
+index e661964..44e622f 100644
 --- a/modal_1/networks.py
 +++ b/modal_1/networks.py
 @@ -67,6 +67,184 @@ class SparseHGNNConv(nn.Module):
@@ -645,21 +651,24 @@ index e661964..8fdf3ad 100644
 
          # ---- Per-modality spatial HGNNs (operate on shared H_spatial) ----
          self.spatial_convs = nn.ModuleList()
-@@ -118,6 +302,13 @@ class DualBranchDHGNN(nn.Module):
+@@ -118,6 +302,16 @@ class DualBranchDHGNN(nn.Module):
                  for _ in range(n_layers)
              ]))
 
-+        self.spatial_refiners = nn.ModuleList()
-+        for _ in range(self.n_modalities):
-+            self.spatial_refiners.append(nn.ModuleList([
-+                HSLSpatialRefiner(hidden_dim, residual_strength=hsl_residual_strength)
-+                for _ in range(n_layers)
-+            ]))
++        # ---- Per-modality HSL refiners ----
++        # HSL learns one shallow refined spatial incidence matrix per modality.
++        # The same refined incidence values are reused by all stacked spatial
++        # HGNN layers, keeping topology refinement stable instead of
++        # recalculating weakly-changing HSL weights at every layer.
++        self.spatial_refiners = nn.ModuleList([
++            nn.ModuleList([HSLSpatialRefiner(hidden_dim, residual_strength=hsl_residual_strength)])
++            for _ in range(self.n_modalities)
++        ])
 +
          # ---- Per-modality feature HGNNs (operate on modality-specific H_feature) ----
          self.feature_convs = nn.ModuleList()
          for _ in range(self.n_modalities):
-@@ -126,25 +317,29 @@ class DualBranchDHGNN(nn.Module):
+@@ -126,25 +320,29 @@ class DualBranchDHGNN(nn.Module):
                  for _ in range(n_layers)
              ]))
 
@@ -700,7 +709,7 @@ index e661964..8fdf3ad 100644
          self.cluster_centers = Parameter(torch.randn(n_classes, hidden_dim) * 0.01)
 
          # ---- Per-modality decoders ----
-@@ -156,66 +351,109 @@ class DualBranchDHGNN(nn.Module):
+@@ -156,66 +354,113 @@ class DualBranchDHGNN(nn.Module):
                  nn.Linear(hidden_dim, dim),
              ))
 
@@ -776,18 +785,22 @@ index e661964..8fdf3ad 100644
              h_s = mod_h[m]
              h_f = mod_h[m]
 
++            # Learn a single shallow refined spatial incidence per modality,
++            # then reuse it across all spatial HGNN layers.  This preserves the
++            # fixed spatial topology while avoiding per-layer HSL recalculation
++            # when deeper HSL weights contribute little in practice.
++            if self.use_hsl_spatial:
++                sp_vals_refined = self.spatial_refiners[m][0](
++                    h_s, sp_rows, sp_cols, sp_vals, n_nodes, n_spatial_edges
++                )
++            else:
++                sp_vals_refined = sp_vals
++
              for layer_i in range(self.n_layers):
 -                # Spatial conv on shared H_spatial
-+                # Spatial conv on shared H_spatial with optional HSL incidence refinement
-+                if self.use_hsl_spatial:
-+                    sp_vals_layer = self.spatial_refiners[m][layer_i](
-+                        h_s, sp_rows, sp_cols, sp_vals, n_nodes, n_spatial_edges
-+                    )
-+                else:
-+                    sp_vals_layer = sp_vals
                  h_s_new = self.spatial_convs[m][layer_i](
 -                    h_s, sp_rows, sp_cols, sp_vals, n_nodes, n_spatial_edges
-+                    h_s, sp_rows, sp_cols, sp_vals_layer, n_nodes, n_spatial_edges
++                    h_s, sp_rows, sp_cols, sp_vals_refined, n_nodes, n_spatial_edges
                  )
 -                # Feature conv on modality-specific H_feature
 +                # Feature conv on modality-specific static or dynamic H_feature
@@ -836,7 +849,7 @@ index e661964..8fdf3ad 100644
          dist = torch.sum(
              (embedding.unsqueeze(1) - self.cluster_centers.unsqueeze(0)) ** 2, dim=2
          )
-@@ -225,14 +463,13 @@ class DualBranchDHGNN(nn.Module):
+@@ -225,14 +470,13 @@ class DualBranchDHGNN(nn.Module):
          mod_recons = [self.decoders[i](embedding) for i in range(self.n_modalities)]
 
          return {
@@ -852,7 +865,7 @@ index e661964..8fdf3ad 100644
          }
 
 
-@@ -271,26 +508,11 @@ def compute_total_loss(
+@@ -271,26 +515,11 @@ def compute_total_loss(
      # Per-modality reconstruction loss
      x_raw = outputs["x_raw"]
      recon_loss = torch.tensor(0.0, device=embedding.device)
@@ -882,7 +895,7 @@ index e661964..8fdf3ad 100644
 
      # DEC KL loss
      if dec_phase:
-@@ -320,7 +542,6 @@ def compute_total_loss(
+@@ -320,7 +549,6 @@ def compute_total_loss(
 
      total = (
          lambda_recon * recon_loss

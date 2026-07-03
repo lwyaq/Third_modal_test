@@ -302,12 +302,15 @@ class DualBranchDHGNN(nn.Module):
                 for _ in range(n_layers)
             ]))
 
-        self.spatial_refiners = nn.ModuleList()
-        for _ in range(self.n_modalities):
-            self.spatial_refiners.append(nn.ModuleList([
-                HSLSpatialRefiner(hidden_dim, residual_strength=hsl_residual_strength)
-                for _ in range(n_layers)
-            ]))
+        # ---- Per-modality HSL refiners ----
+        # HSL learns one shallow refined spatial incidence matrix per modality.
+        # The same refined incidence values are reused by all stacked spatial
+        # HGNN layers, keeping topology refinement stable instead of
+        # recalculating weakly-changing HSL weights at every layer.
+        self.spatial_refiners = nn.ModuleList([
+            nn.ModuleList([HSLSpatialRefiner(hidden_dim, residual_strength=hsl_residual_strength)])
+            for _ in range(self.n_modalities)
+        ])
 
         # ---- Per-modality feature HGNNs (operate on modality-specific H_feature) ----
         self.feature_convs = nn.ModuleList()
@@ -413,16 +416,20 @@ class DualBranchDHGNN(nn.Module):
             h_s = mod_h[m]
             h_f = mod_h[m]
 
+            # Learn a single shallow refined spatial incidence per modality,
+            # then reuse it across all spatial HGNN layers.  This preserves the
+            # fixed spatial topology while avoiding per-layer HSL recalculation
+            # when deeper HSL weights contribute little in practice.
+            if self.use_hsl_spatial:
+                sp_vals_refined = self.spatial_refiners[m][0](
+                    h_s, sp_rows, sp_cols, sp_vals, n_nodes, n_spatial_edges
+                )
+            else:
+                sp_vals_refined = sp_vals
+
             for layer_i in range(self.n_layers):
-                # Spatial conv on shared H_spatial with optional HSL incidence refinement
-                if self.use_hsl_spatial:
-                    sp_vals_layer = self.spatial_refiners[m][layer_i](
-                        h_s, sp_rows, sp_cols, sp_vals, n_nodes, n_spatial_edges
-                    )
-                else:
-                    sp_vals_layer = sp_vals
                 h_s_new = self.spatial_convs[m][layer_i](
-                    h_s, sp_rows, sp_cols, sp_vals_layer, n_nodes, n_spatial_edges
+                    h_s, sp_rows, sp_cols, sp_vals_refined, n_nodes, n_spatial_edges
                 )
                 # Feature conv on modality-specific static or dynamic H_feature
                 if self.use_dynamic_feature:

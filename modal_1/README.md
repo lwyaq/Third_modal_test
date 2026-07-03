@@ -20,8 +20,10 @@ RNA features X_RNA          ATAC features X_ATAC          spatial coordinates C
 For each modality m in {RNA, ATAC}:
   1. Spatial branch:
      - Use the fixed Delaunay-star spatial topology.
-     - Apply HSLSpatialRefiner to learn incidence weights only.
-     - Do not add or remove spatial hyperedges.
+     - Apply HSLSpatialRefiner once on the shallow modality representation to
+       learn refined incidence weights only.
+     - Reuse the refined spatial incidence values across all stacked spatial
+       HGNN layers; do not add or remove spatial hyperedges.
 
   2. Feature branch:
      - Initialize dynamic feature hyperedge prototypes from that modality's
@@ -63,13 +65,17 @@ This is intentional: each modality must be encoded independently.
 ### HSL spatial refinement
 
 `HSLSpatialRefiner` refines only the incidence values of the fixed spatial
-hypergraph:
+hypergraph.  For each modality, HSL is computed once from the shallow encoded
+representation and the resulting refined incidence values are shared by all
+stacked spatial HGNN layers:
 
 ```text
-H_spatial_refined = H_spatial^0 ⊙ G_theta(Z_m)
+H_spatial_refined = H_spatial^0 ⊙ G_theta(Z_m^(0))
+H_s,m^(l+1) = SHGNN^(l)(H_s,m^(l), H_spatial_refined)
 ```
 
-The spatial topology is not reconstructed during training.
+The spatial topology is not reconstructed during training, and later spatial
+layers do not recalculate separate HSL weights.
 
 ### Dynamic biological feature hypergraphs
 
