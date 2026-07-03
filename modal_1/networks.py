@@ -67,6 +67,39 @@ class SparseHGNNConv(nn.Module):
         return x_out
 
 
+class SharedModalityEncoder(nn.Module):
+    """Modality encoder with shared weights and optional dropout.
+
+    Cell nodes and biological feature-hyperedge prototypes should be projected
+    into the same modality-specific latent space.  During training, dropout is
+    useful for cell-node regularization, but stochastic prototype embeddings can
+    perturb dynamic top-k hypergraph construction.  ``apply_dropout`` therefore
+    lets the node path use dropout while the prototype path reuses all linear
+    and normalization weights without dropout.
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int, dropout: float = 0.2):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.act1 = nn.GELU()
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.act2 = nn.GELU()
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x: torch.Tensor, apply_dropout: bool = True) -> torch.Tensor:
+        h = self.fc1(x)
+        h = self.act1(h)
+        h = self.norm1(h)
+        if apply_dropout:
+            h = self.dropout(h)
+        h = self.fc2(h)
+        h = self.act2(h)
+        h = self.norm2(h)
+        return h
+
+
 class HSLSpatialRefiner(nn.Module):
     """Learn incidence weights on a fixed spatial hypergraph topology."""
 
@@ -252,17 +285,14 @@ class DualBranchDHGNN(nn.Module):
         self.use_dynamic_feature = use_dynamic_feature
 
         # ---- Per-modality encoders ----
-        self.encoders = nn.ModuleList()
-        for dim in input_dims:
-            self.encoders.append(nn.Sequential(
-                nn.Linear(dim, hidden_dim),
-                nn.GELU(),
-                nn.LayerNorm(hidden_dim),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.LayerNorm(hidden_dim),
-            ))
+        # Cell nodes and feature-hyperedge prototypes share encoder weights so
+        # their latent representations remain comparable.  The forward call
+        # controls dropout: cells use it for regularization, while prototypes
+        # skip it to keep dynamic top-k hypergraph construction deterministic.
+        self.encoders = nn.ModuleList([
+            SharedModalityEncoder(dim, hidden_dim, dropout=dropout)
+            for dim in input_dims
+        ])
 
         # ---- Per-modality spatial HGNNs (operate on shared H_spatial) ----
         self.spatial_convs = nn.ModuleList()
@@ -360,15 +390,18 @@ class DualBranchDHGNN(nn.Module):
         # ---- Per-modality encoding (no cross-omics concatenation at input) ----
         mod_h = []
         for i in range(self.n_modalities):
-            mod_h.append(self.encoders[i](x_raw[i]))
+            mod_h.append(self.encoders[i](x_raw[i], apply_dropout=True))
 
         dynamic_edge_h = [None for _ in range(self.n_modalities)]
         if self.use_dynamic_feature:
             for i, builder in enumerate(self.dynamic_feature_builders):
-                # Encode biological hyperedge prototypes with the same
-                # modality encoder used for cells, so attention compares
-                # nodes and prototypes in one shared hidden space.
-                dynamic_edge_h[i] = self.encoders[i](builder.edge_raw_features)
+                # Reuse the same modality encoder weights as the cell path so
+                # prototypes and nodes stay in one latent space, but disable
+                # dropout to avoid stochastic topology changes in dynamic top-k
+                # hypergraph construction.
+                dynamic_edge_h[i] = self.encoders[i](
+                    builder.edge_raw_features, apply_dropout=False
+                )
 
         # ---- Per-modality dual HGNN message passing ----
         mod_embeddings = []

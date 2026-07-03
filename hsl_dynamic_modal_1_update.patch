@@ -1,9 +1,9 @@
 diff --git a/modal_1/README.md b/modal_1/README.md
 new file mode 100644
-index 0000000..57489c6
+index 0000000..50a8932
 --- /dev/null
 +++ b/modal_1/README.md
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,309 @@
 +# HSL-DvDHGNN (`modal_1`)
 +
 +This folder contains the current unsupervised spatial multi-omics model implementation.
@@ -84,9 +84,12 @@ index 0000000..57489c6
 +The initial number of feature hyperedges is the cell count (`M0 = N`), because
 +each cell's preprocessed feature vector is used as one candidate biological
 +prototype. The raw prototypes remain in the biological feature space and are
-+encoded into `hidden_dim` with the same modality encoder used by cell nodes
-+before attention is computed; they are not sampled from hidden embeddings or
-+random Gaussian hyperedges, and they no longer use a separate edge-only encoder.
++encoded into `hidden_dim` with the same modality encoder weights used by cell
++nodes before attention is computed; they are not sampled from hidden embeddings
++or random Gaussian hyperedges.  The encoder exposes separate node/prototype
++paths only for dropout control: node embeddings use dropout for regularization,
++while prototype embeddings reuse the same linear/normalization weights with
++dropout disabled to avoid stochastic dynamic-topology perturbations.
 +
 +### Discrepancy-aware intra-modal structure/feature fusion
 +
@@ -403,13 +406,46 @@ index 3945f1f..7632375 100644
      """Estimate DBSCAN eps via the k-distance knee heuristic."""
      nn = NearestNeighbors(n_neighbors=k + 1, n_jobs=-1)
 diff --git a/modal_1/networks.py b/modal_1/networks.py
-index e661964..0879477 100644
+index e661964..8fdf3ad 100644
 --- a/modal_1/networks.py
 +++ b/modal_1/networks.py
-@@ -67,6 +67,151 @@ class SparseHGNNConv(nn.Module):
+@@ -67,6 +67,184 @@ class SparseHGNNConv(nn.Module):
          return x_out
 
 
++class SharedModalityEncoder(nn.Module):
++    """Modality encoder with shared weights and optional dropout.
++
++    Cell nodes and biological feature-hyperedge prototypes should be projected
++    into the same modality-specific latent space.  During training, dropout is
++    useful for cell-node regularization, but stochastic prototype embeddings can
++    perturb dynamic top-k hypergraph construction.  ``apply_dropout`` therefore
++    lets the node path use dropout while the prototype path reuses all linear
++    and normalization weights without dropout.
++    """
++
++    def __init__(self, in_dim: int, hidden_dim: int, dropout: float = 0.2):
++        super().__init__()
++        self.fc1 = nn.Linear(in_dim, hidden_dim)
++        self.act1 = nn.GELU()
++        self.norm1 = nn.LayerNorm(hidden_dim)
++        self.dropout = nn.Dropout(dropout)
++        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
++        self.act2 = nn.GELU()
++        self.norm2 = nn.LayerNorm(hidden_dim)
++
++    def forward(self, x: torch.Tensor, apply_dropout: bool = True) -> torch.Tensor:
++        h = self.fc1(x)
++        h = self.act1(h)
++        h = self.norm1(h)
++        if apply_dropout:
++            h = self.dropout(h)
++        h = self.fc2(h)
++        h = self.act2(h)
++        h = self.norm2(h)
++        return h
++
++
 +class HSLSpatialRefiner(nn.Module):
 +    """Learn incidence weights on a fixed spatial hypergraph topology."""
 +
@@ -558,7 +594,7 @@ index e661964..0879477 100644
  # ====================================================================== #
  #              Per-Modality Dual-Hypergraph Model (v9b)                   #
  # ====================================================================== #
-@@ -79,7 +224,7 @@ class DualBranchDHGNN(nn.Module):
+@@ -79,7 +257,7 @@ class DualBranchDHGNN(nn.Module):
        - Encoder: x_m -> h_m (hidden_dim)
        - Spatial HGNN: message passing on shared H_spatial
        - Feature HGNN: message passing on modality-specific H_feature_m
@@ -567,7 +603,7 @@ index e661964..0879477 100644
 
      Cross-modal fusion: gate_rna * h_rna + (1-gate_rna) * h_atac
      """
-@@ -91,11 +236,20 @@ class DualBranchDHGNN(nn.Module):
+@@ -91,24 +269,30 @@ class DualBranchDHGNN(nn.Module):
          n_classes: int = 14,
          n_layers: int = 3,
          dropout: float = 0.2,
@@ -587,8 +623,29 @@ index e661964..0879477 100644
 +        self.use_dynamic_feature = use_dynamic_feature
 
          # ---- Per-modality encoders ----
-         self.encoders = nn.ModuleList()
-@@ -118,6 +272,13 @@ class DualBranchDHGNN(nn.Module):
+-        self.encoders = nn.ModuleList()
+-        for dim in input_dims:
+-            self.encoders.append(nn.Sequential(
+-                nn.Linear(dim, hidden_dim),
+-                nn.GELU(),
+-                nn.LayerNorm(hidden_dim),
+-                nn.Dropout(dropout),
+-                nn.Linear(hidden_dim, hidden_dim),
+-                nn.GELU(),
+-                nn.LayerNorm(hidden_dim),
+-            ))
++        # Cell nodes and feature-hyperedge prototypes share encoder weights so
++        # their latent representations remain comparable.  The forward call
++        # controls dropout: cells use it for regularization, while prototypes
++        # skip it to keep dynamic top-k hypergraph construction deterministic.
++        self.encoders = nn.ModuleList([
++            SharedModalityEncoder(dim, hidden_dim, dropout=dropout)
++            for dim in input_dims
++        ])
+
+         # ---- Per-modality spatial HGNNs (operate on shared H_spatial) ----
+         self.spatial_convs = nn.ModuleList()
+@@ -118,6 +302,13 @@ class DualBranchDHGNN(nn.Module):
                  for _ in range(n_layers)
              ]))
 
@@ -602,7 +659,7 @@ index e661964..0879477 100644
          # ---- Per-modality feature HGNNs (operate on modality-specific H_feature) ----
          self.feature_convs = nn.ModuleList()
          for _ in range(self.n_modalities):
-@@ -126,25 +287,29 @@ class DualBranchDHGNN(nn.Module):
+@@ -126,25 +317,29 @@ class DualBranchDHGNN(nn.Module):
                  for _ in range(n_layers)
              ]))
 
@@ -643,7 +700,7 @@ index e661964..0879477 100644
          self.cluster_centers = Parameter(torch.randn(n_classes, hidden_dim) * 0.01)
 
          # ---- Per-modality decoders ----
-@@ -156,66 +321,106 @@ class DualBranchDHGNN(nn.Module):
+@@ -156,66 +351,109 @@ class DualBranchDHGNN(nn.Module):
                  nn.Linear(hidden_dim, dim),
              ))
 
@@ -695,15 +752,18 @@ index e661964..0879477 100644
 -            d = self.input_dims[i]
 -            mod_h.append(self.encoders[i](x[:, offset:offset + d]))
 -            offset += d
-+            mod_h.append(self.encoders[i](x_raw[i]))
++            mod_h.append(self.encoders[i](x_raw[i], apply_dropout=True))
 +
 +        dynamic_edge_h = [None for _ in range(self.n_modalities)]
 +        if self.use_dynamic_feature:
 +            for i, builder in enumerate(self.dynamic_feature_builders):
-+                # Encode biological hyperedge prototypes with the same
-+                # modality encoder used for cells, so attention compares
-+                # nodes and prototypes in one shared hidden space.
-+                dynamic_edge_h[i] = self.encoders[i](builder.edge_raw_features)
++                # Reuse the same modality encoder weights as the cell path so
++                # prototypes and nodes stay in one latent space, but disable
++                # dropout to avoid stochastic topology changes in dynamic top-k
++                # hypergraph construction.
++                dynamic_edge_h[i] = self.encoders[i](
++                    builder.edge_raw_features, apply_dropout=False
++                )
 
          # ---- Per-modality dual HGNN message passing ----
          mod_embeddings = []
@@ -776,7 +836,7 @@ index e661964..0879477 100644
          dist = torch.sum(
              (embedding.unsqueeze(1) - self.cluster_centers.unsqueeze(0)) ** 2, dim=2
          )
-@@ -225,14 +430,13 @@ class DualBranchDHGNN(nn.Module):
+@@ -225,14 +463,13 @@ class DualBranchDHGNN(nn.Module):
          mod_recons = [self.decoders[i](embedding) for i in range(self.n_modalities)]
 
          return {
@@ -792,7 +852,7 @@ index e661964..0879477 100644
          }
 
 
-@@ -271,26 +475,11 @@ def compute_total_loss(
+@@ -271,26 +508,11 @@ def compute_total_loss(
      # Per-modality reconstruction loss
      x_raw = outputs["x_raw"]
      recon_loss = torch.tensor(0.0, device=embedding.device)
@@ -822,7 +882,7 @@ index e661964..0879477 100644
 
      # DEC KL loss
      if dec_phase:
-@@ -320,7 +509,6 @@ def compute_total_loss(
+@@ -320,7 +542,6 @@ def compute_total_loss(
 
      total = (
          lambda_recon * recon_loss

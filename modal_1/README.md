@@ -78,9 +78,12 @@ from the corresponding preprocessed modality features (RNA PCA / ATAC LSI).
 The initial number of feature hyperedges is the cell count (`M0 = N`), because
 each cell's preprocessed feature vector is used as one candidate biological
 prototype. The raw prototypes remain in the biological feature space and are
-encoded into `hidden_dim` with the same modality encoder used by cell nodes
-before attention is computed; they are not sampled from hidden embeddings or
-random Gaussian hyperedges, and they no longer use a separate edge-only encoder.
+encoded into `hidden_dim` with the same modality encoder weights used by cell
+nodes before attention is computed; they are not sampled from hidden embeddings
+or random Gaussian hyperedges.  The encoder exposes separate node/prototype
+paths only for dropout control: node embeddings use dropout for regularization,
+while prototype embeddings reuse the same linear/normalization weights with
+dropout disabled to avoid stochastic dynamic-topology perturbations.
 
 ### Discrepancy-aware intra-modal structure/feature fusion
 
