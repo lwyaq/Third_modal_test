@@ -142,13 +142,14 @@ class DiscrepancyAwareStructureFeatureAttention(nn.Module):
 
     The fusion score sees both branch embeddings, their absolute discrepancy,
     and their element-wise agreement.  It returns a per-node two-way attention
-    over the spatial-structure branch and the feature-hypergraph branch, plus a
-    weak average-view residual to avoid prematurely suppressing either view.
+    over the spatial-structure branch and the feature-hypergraph branch.  A
+    zero-initialized learnable average-view residual lets the model decide
+    whether additional residual mixing is useful during training.
     """
 
-    def __init__(self, hidden_dim: int, dropout: float = 0.2, residual_strength: float = 0.1):
+    def __init__(self, hidden_dim: int, dropout: float = 0.2, residual_strength: float = 0.0):
         super().__init__()
-        self.residual_strength = residual_strength
+        self.res_scale = nn.Parameter(torch.tensor(float(residual_strength)))
         self.scorer = nn.Sequential(
             nn.Linear(hidden_dim * 4, hidden_dim),
             nn.GELU(),
@@ -161,7 +162,7 @@ class DiscrepancyAwareStructureFeatureAttention(nn.Module):
         alpha = torch.softmax(self.scorer(fusion_input), dim=1)
         attention_mix = alpha[:, :1] * h_s + alpha[:, 1:] * h_f
         residual = 0.5 * (h_s + h_f)
-        merged = attention_mix + self.residual_strength * residual
+        merged = attention_mix + self.res_scale * residual
         return merged, alpha
 
 

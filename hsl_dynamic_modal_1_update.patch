@@ -1,9 +1,9 @@
 diff --git a/modal_1/README.md b/modal_1/README.md
 new file mode 100644
-index 0000000..64c12b9
+index 0000000..860232e
 --- /dev/null
 +++ b/modal_1/README.md
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,317 @@
 +# HSL-DvDHGNN (`modal_1`)
 +
 +This folder contains the current unsupervised spatial multi-omics model implementation.
@@ -107,15 +107,17 @@ index 0000000..64c12b9
 +```text
 +[h_s, h_f, |h_s - h_f|, h_s ⊙ h_f] -> softmax(alpha_s, alpha_f)
 +Z_m(v) = Norm(alpha_s(v) * h_s(v) + alpha_f(v) * h_f(v)
-+              + lambda_r * (h_s(v) + h_f(v)) / 2)
++              + rho * (h_s(v) + h_f(v)) / 2)
++
++rho is a learnable residual coefficient initialized to 0.
 +```
 +
 +This replaces the older modality-level scalar gate with a node-wise
 +discrepancy-aware attention mechanism.  Spatial and feature branch streams stay
 +separate across stacked HGNN layers, then fuse once after the final layer.  The
-+weak residual term keeps both views available during fusion and reduces the risk
-+that the attention module suppresses either the spatial or feature view too
-+early.
++learnable residual coefficient starts at 0 so the initial fusion is pure
++attention, and it can adapt during training if preserving the average
++structure/feature view improves stability.
 +
 +### Unsupervised objective
 +
@@ -412,10 +414,10 @@ index 3945f1f..7632375 100644
      """Estimate DBSCAN eps via the k-distance knee heuristic."""
      nn = NearestNeighbors(n_neighbors=k + 1, n_jobs=-1)
 diff --git a/modal_1/networks.py b/modal_1/networks.py
-index e661964..44e622f 100644
+index e661964..30387e1 100644
 --- a/modal_1/networks.py
 +++ b/modal_1/networks.py
-@@ -67,6 +67,184 @@ class SparseHGNNConv(nn.Module):
+@@ -67,6 +67,185 @@ class SparseHGNNConv(nn.Module):
          return x_out
 
 
@@ -494,13 +496,14 @@ index e661964..44e622f 100644
 +
 +    The fusion score sees both branch embeddings, their absolute discrepancy,
 +    and their element-wise agreement.  It returns a per-node two-way attention
-+    over the spatial-structure branch and the feature-hypergraph branch, plus a
-+    weak average-view residual to avoid prematurely suppressing either view.
++    over the spatial-structure branch and the feature-hypergraph branch.  A
++    zero-initialized learnable average-view residual lets the model decide
++    whether additional residual mixing is useful during training.
 +    """
 +
-+    def __init__(self, hidden_dim: int, dropout: float = 0.2, residual_strength: float = 0.1):
++    def __init__(self, hidden_dim: int, dropout: float = 0.2, residual_strength: float = 0.0):
 +        super().__init__()
-+        self.residual_strength = residual_strength
++        self.res_scale = nn.Parameter(torch.tensor(float(residual_strength)))
 +        self.scorer = nn.Sequential(
 +            nn.Linear(hidden_dim * 4, hidden_dim),
 +            nn.GELU(),
@@ -513,7 +516,7 @@ index e661964..44e622f 100644
 +        alpha = torch.softmax(self.scorer(fusion_input), dim=1)
 +        attention_mix = alpha[:, :1] * h_s + alpha[:, 1:] * h_f
 +        residual = 0.5 * (h_s + h_f)
-+        merged = attention_mix + self.residual_strength * residual
++        merged = attention_mix + self.res_scale * residual
 +        return merged, alpha
 +
 +
@@ -600,7 +603,7 @@ index e661964..44e622f 100644
  # ====================================================================== #
  #              Per-Modality Dual-Hypergraph Model (v9b)                   #
  # ====================================================================== #
-@@ -79,7 +257,7 @@ class DualBranchDHGNN(nn.Module):
+@@ -79,7 +258,7 @@ class DualBranchDHGNN(nn.Module):
        - Encoder: x_m -> h_m (hidden_dim)
        - Spatial HGNN: message passing on shared H_spatial
        - Feature HGNN: message passing on modality-specific H_feature_m
@@ -609,7 +612,7 @@ index e661964..44e622f 100644
 
      Cross-modal fusion: gate_rna * h_rna + (1-gate_rna) * h_atac
      """
-@@ -91,24 +269,30 @@ class DualBranchDHGNN(nn.Module):
+@@ -91,24 +270,30 @@ class DualBranchDHGNN(nn.Module):
          n_classes: int = 14,
          n_layers: int = 3,
          dropout: float = 0.2,
@@ -651,7 +654,7 @@ index e661964..44e622f 100644
 
          # ---- Per-modality spatial HGNNs (operate on shared H_spatial) ----
          self.spatial_convs = nn.ModuleList()
-@@ -118,6 +302,16 @@ class DualBranchDHGNN(nn.Module):
+@@ -118,6 +303,16 @@ class DualBranchDHGNN(nn.Module):
                  for _ in range(n_layers)
              ]))
 
@@ -668,7 +671,7 @@ index e661964..44e622f 100644
          # ---- Per-modality feature HGNNs (operate on modality-specific H_feature) ----
          self.feature_convs = nn.ModuleList()
          for _ in range(self.n_modalities):
-@@ -126,25 +320,29 @@ class DualBranchDHGNN(nn.Module):
+@@ -126,25 +321,29 @@ class DualBranchDHGNN(nn.Module):
                  for _ in range(n_layers)
              ]))
 
@@ -709,7 +712,7 @@ index e661964..44e622f 100644
          self.cluster_centers = Parameter(torch.randn(n_classes, hidden_dim) * 0.01)
 
          # ---- Per-modality decoders ----
-@@ -156,66 +354,113 @@ class DualBranchDHGNN(nn.Module):
+@@ -156,66 +355,113 @@ class DualBranchDHGNN(nn.Module):
                  nn.Linear(hidden_dim, dim),
              ))
 
@@ -849,7 +852,7 @@ index e661964..44e622f 100644
          dist = torch.sum(
              (embedding.unsqueeze(1) - self.cluster_centers.unsqueeze(0)) ** 2, dim=2
          )
-@@ -225,14 +470,13 @@ class DualBranchDHGNN(nn.Module):
+@@ -225,14 +471,13 @@ class DualBranchDHGNN(nn.Module):
          mod_recons = [self.decoders[i](embedding) for i in range(self.n_modalities)]
 
          return {
@@ -865,7 +868,7 @@ index e661964..44e622f 100644
          }
 
 
-@@ -271,26 +515,11 @@ def compute_total_loss(
+@@ -271,26 +516,11 @@ def compute_total_loss(
      # Per-modality reconstruction loss
      x_raw = outputs["x_raw"]
      recon_loss = torch.tensor(0.0, device=embedding.device)
@@ -895,7 +898,7 @@ index e661964..44e622f 100644
 
      # DEC KL loss
      if dec_phase:
-@@ -320,7 +549,6 @@ def compute_total_loss(
+@@ -320,7 +550,6 @@ def compute_total_loss(
 
      total = (
          lambda_recon * recon_loss

@@ -101,15 +101,17 @@ absolute discrepancy, and their element-wise agreement:
 ```text
 [h_s, h_f, |h_s - h_f|, h_s ⊙ h_f] -> softmax(alpha_s, alpha_f)
 Z_m(v) = Norm(alpha_s(v) * h_s(v) + alpha_f(v) * h_f(v)
-              + lambda_r * (h_s(v) + h_f(v)) / 2)
+              + rho * (h_s(v) + h_f(v)) / 2)
+
+rho is a learnable residual coefficient initialized to 0.
 ```
 
 This replaces the older modality-level scalar gate with a node-wise
 discrepancy-aware attention mechanism.  Spatial and feature branch streams stay
 separate across stacked HGNN layers, then fuse once after the final layer.  The
-weak residual term keeps both views available during fusion and reduces the risk
-that the attention module suppresses either the spatial or feature view too
-early.
+learnable residual coefficient starts at 0 so the initial fusion is pure
+attention, and it can adapt during training if preserving the average
+structure/feature view improves stability.
 
 ### Unsupervised objective
 
