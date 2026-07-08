@@ -24,6 +24,7 @@ from modal_1.hypergraph import (
     delaunay_star_edges, build_incidence,
     compute_expression_weighted_incidence,
 )
+from modal_1.utils import compute_morans_i
 
 
 def mclust_via_r(embedding, n_clusters, seed=42):
@@ -76,6 +77,15 @@ def _incidence_to_sparse_tensors(H, device):
         torch.LongTensor(H_coo.col).to(device),
         torch.FloatTensor(H_coo.data).to(device),
     )
+
+
+def _mean_cluster_morans_i(coords, predictions, k=10):
+    """Mean one-vs-rest Moran's I over clusters for unlabeled spatial data."""
+    cluster_scores = [
+        compute_morans_i(coords, (predictions == cluster_id).astype(float), k=k)
+        for cluster_id in np.unique(predictions)
+    ]
+    return float(np.mean(cluster_scores)) if cluster_scores else 0.0
 
 
 class DHGNNTrainer:
@@ -253,8 +263,12 @@ class DHGNNTrainer:
                 km.fit(emb)
                 model.cluster_centers.data.copy_(torch.FloatTensor(km.cluster_centers_).to(self.device))
                 dec_initialized = True
-                init_ari = adjusted_rand_score(self.labels, km.labels_) if self.labels is not None else -1
-                print(f"  KMeans init ARI: {init_ari:.4f}")
+                if self.labels is not None:
+                    init_ari = adjusted_rand_score(self.labels, km.labels_)
+                    print(f"  KMeans init ARI: {init_ari:.4f}")
+                else:
+                    init_morans_i = _mean_cluster_morans_i(self.coords, km.labels_)
+                    print(f"  KMeans init Moran's I: {init_morans_i:.4f}")
                 # Warmup and DEC optimize different objectives; reset loss-based
                 # model selection so DEC checkpoints are not compared against
                 # lower warmup losses that do not include cluster KL.
@@ -333,6 +347,10 @@ class DHGNNTrainer:
                     patience_counter += 1
                 current_ari = metrics.get("ari", -1)
                 current_nmi = metrics.get("nmi", -1)
+                current_observed_name = "ARI" if self.labels is not None else "Moran's I"
+                current_observed_value = (
+                    current_ari if self.labels is not None else metrics.get("morans_i", 0.0)
+                )
                 if self.labels is not None and current_ari > best_observed_ari:
                     best_observed_ari = current_ari
                     best_observed_nmi = current_nmi
@@ -364,7 +382,8 @@ class DHGNNTrainer:
                         f"(recon={loss_dict.get('recon', 0):.3f}, "
                         f"clust={loss_dict.get('cluster', 0):.3f}, "
                         f"sm_s={loss_dict.get('smooth_s', 0):.3f}) | "
-                        f"ARI {current_ari:.4f} | best_loss {best_loss:.4f}@{best_epoch+1}"
+                        f"{current_observed_name} {current_observed_value:.4f} | "
+                        f"best_loss {best_loss:.4f}@{best_epoch+1}"
                         f"{stability_msg} | {time.time()-t0:.1f}s"
                     )
 
@@ -399,6 +418,8 @@ class DHGNNTrainer:
                 f"at epoch {best_observed_epoch+1} "
                 f"(NMI={best_observed_nmi:.4f}; label-based report only)"
             )
+        elif "morans_i" in metrics:
+            print(f"Final: Moran's I={metrics['morans_i']:.4f}")
 
         self.model = model
         self.embeddings = metrics.get("embedding", None)
@@ -452,6 +473,8 @@ class DHGNNTrainer:
                 metrics["silhouette"] = silhouette_score(embedding, predictions)
             except Exception:
                 metrics["silhouette"] = 0.0
+        else:
+            metrics["morans_i"] = _mean_cluster_morans_i(self.coords, predictions)
         return metrics
 
     def get_embedding(self):
