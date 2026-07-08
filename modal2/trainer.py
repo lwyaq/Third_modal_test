@@ -19,12 +19,12 @@ from sklearn.metrics import (
     adjusted_mutual_info_score, silhouette_score,
 )
 
-from modal_1.networks import DualBranchDHGNN, compute_total_loss
-from modal_1.hypergraph import (
+from modal2.networks import DualBranchDHGNN, compute_total_loss
+from modal2.hypergraph import (
     delaunay_star_edges, build_incidence,
     compute_expression_weighted_incidence,
 )
-from modal_1.utils import compute_morans_i
+from modal2.utils import compute_morans_i
 
 
 def mclust_via_r(embedding, n_clusters, seed=42):

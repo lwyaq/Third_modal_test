@@ -6,7 +6,7 @@ Dataset: data/human_lynode/
   - adata_ADT_with_annotation.h5ad
 
 Usage:
-    python -m modal_1.run_human_lynode [--epochs 500 --lr 0.001 --seed 42]
+    python -m modal2.run_human_lynode [--epochs 500 --lr 0.001 --seed 42]
 """
 
 from __future__ import annotations
@@ -24,9 +24,9 @@ warnings.filterwarnings("ignore")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modal_1.preprocessing import pca, extract_coords
-from modal_1.trainer import DHGNNTrainer
-from modal_1.utils import evaluate_clustering, print_metrics, label_encode, setup_seed
+from modal2.preprocessing import pca, extract_coords
+from modal2.trainer import DHGNNTrainer
+from modal2.utils import evaluate_clustering, print_metrics, label_encode, setup_seed
 
 
 def parse_args():

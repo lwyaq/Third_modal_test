@@ -1,6 +1,6 @@
 """
 Grid search for DvDHGNN on Human Lymph Node dataset.
-Usage: python -m modal_1.grid_search_lynode
+Usage: python -m modal2.grid_search_lynode
 """
 from __future__ import annotations
 import itertools, os, sys, time, warnings
@@ -12,9 +12,9 @@ import torch
 warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modal_1.preprocessing import pca, extract_coords
-from modal_1.trainer import DHGNNTrainer
-from modal_1.utils import evaluate_clustering, label_encode, setup_seed
+from modal2.preprocessing import pca, extract_coords
+from modal2.trainer import DHGNNTrainer
+from modal2.utils import evaluate_clustering, label_encode, setup_seed
 
 PARAM_GRID = {
     "hidden_dim": [64, 128],
@@ -43,7 +43,7 @@ FIXED_PARAMS = {
     "epochs": 500, "patience": 80,
     "dec_stability_patience": 5, "dec_stability_tol": 0.003,
     "dec_stability_min_epochs": 50, "max_spatial_edges": 3484,
-    "gamma_saturation": 0.99, "min_edges": 80, "delta_edges": 15,
+    "gamma_saturation": 0.99, "edge_evolve_ratio": 0.05, "min_edges": 80, "delta_edges": 15,
     "allow_edge_add": True, "use_hsl_spatial": True,
     "use_dynamic_feature": True, "seed": 42,
 }
@@ -108,6 +108,7 @@ def run_trial(params, data_bundle):
         delta_edges=params["delta_edges"],
         beta_saturation=params["beta_saturation"],
         gamma_saturation=params["gamma_saturation"],
+        edge_evolve_ratio=params["edge_evolve_ratio"],
         topk_edges=params["topk_edges"],
         min_edges=params["min_edges"],
         max_edges=coords.shape[0],
