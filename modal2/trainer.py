@@ -93,6 +93,7 @@ class DHGNNTrainer:
         seed=42, device="cpu",
         lambda_cluster=0.5, lambda_smooth=0.1,
         lambda_recon=0.5, lambda_contrast=0.0,
+        lambda_balance=0.01,
         max_spatial_edges=2000,
         gene_expression_matrices=None,
         expression_features=None, expression_weight=True,
@@ -138,6 +139,7 @@ class DHGNNTrainer:
         self.lambda_smooth = lambda_smooth
         self.lambda_recon = lambda_recon
         self.lambda_contrast = lambda_contrast
+        self.lambda_balance = lambda_balance
         self.max_spatial_edges = max_spatial_edges
         self.gene_expression_matrices = gene_expression_matrices or []
         self.expression_features = expression_features
@@ -239,7 +241,7 @@ class DHGNNTrainer:
                   f"feature_hypergraph={feature_desc}")
         print(f"  Spatial: {self.n_spatial_edges} edges (shared Delaunay-star)")
         print(f"  Losses: recon({self.lambda_recon}) + cluster({self.lambda_cluster}) "
-              f"+ smooth({self.lambda_smooth})")
+              f"+ smooth({self.lambda_smooth}) + balance({self.lambda_balance})")
         print(f"  HSL spatial: {self.use_hsl_spatial}; dynamic feature: {self.use_dynamic_feature}")
         print(f"  Edge evolution: interval={self.edge_adjust_interval}, "
               f"evolve_ratio={self.edge_evolve_ratio}, "
@@ -296,6 +298,7 @@ class DHGNNTrainer:
                 lambda_smooth=self.lambda_smooth,
                 lambda_recon=self.lambda_recon,
                 lambda_contrast=self.lambda_contrast,
+                lambda_balance=self.lambda_balance,
                 dec_phase=dec_initialized,
             )
 
@@ -395,7 +398,8 @@ class DHGNNTrainer:
                         f"Loss {loss_dict['total']:.4f} "
                         f"(recon={loss_dict.get('recon', 0):.3f}, "
                         f"clust={loss_dict.get('cluster', 0):.3f}, "
-                        f"sm_s={loss_dict.get('smooth_s', 0):.3f}) | "
+                        f"sm_s={loss_dict.get('smooth_s', 0):.3f}, "
+                        f"bal={loss_dict.get('balance', 0):.3f}) | "
                         f"ARI {current_ari:.4f} | best_loss {best_loss:.4f}@{best_epoch+1}"
                         f"{mi_msg}{stability_msg} | {time.time()-t0:.1f}s"
                     )

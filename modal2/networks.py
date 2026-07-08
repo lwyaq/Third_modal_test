@@ -692,11 +692,24 @@ def smoothness_loss_sparse(x, rows, cols, vals, n_nodes, n_edges):
     return F.mse_loss(x, x_recon)
 
 
+def incidence_balance_loss(cols, vals, n_edges):
+    """Encourage dynamic feature-hyperedge assignments to avoid collapse.
+
+    The loss is zero when attention mass is uniformly distributed over all
+    available hyperedges and grows as mass concentrates on a small subset.
+    """
+    mass = torch.zeros(n_edges, device=vals.device)
+    mass.scatter_add_(0, cols, vals.float())
+    prob = mass / mass.sum().clamp_min(1e-8)
+    return n_edges * torch.sum(prob ** 2) - 1.0
+
+
 def compute_total_loss(
     outputs, sp_rows, sp_cols, sp_vals,
     n_nodes, n_spatial_edges, input_dims,
     lambda_cluster=1.0, lambda_smooth=0.1,
     lambda_recon=0.5, lambda_contrast=0.0,
+    lambda_balance=0.01,
     dec_phase=True, temperature=0.5,
 ):
     embedding = outputs["embedding"]
@@ -730,21 +743,25 @@ def compute_total_loss(
         embedding, sp_rows, sp_cols, sp_vals, n_nodes, n_spatial_edges
     )
 
-    # Smoothness on each modality's feature hypergraph
+    # Smoothness and load balance on each modality's feature hypergraph
     sm_feat_total = torch.tensor(0.0, device=embedding.device)
+    balance_total = torch.tensor(0.0, device=embedding.device)
     for ft_rows, ft_cols, ft_vals, n_feat_edges in outputs["feat_tensors"]:
         sm_feat_total = sm_feat_total + smoothness_loss_sparse(
             embedding, ft_rows, ft_cols, ft_vals, n_nodes, n_feat_edges
         )
+        balance_total = balance_total + incidence_balance_loss(ft_cols, ft_vals, n_feat_edges)
 
     total = (
         lambda_recon * recon_loss
         + lambda_cluster * clust_loss
         + lambda_smooth * (sm_spatial + sm_feat_total)
+        + lambda_balance * balance_total
     )
     loss_dict = {
         "total": total.item(), "recon": recon_loss.item(),
         "contrast": contrast_loss.item(), "cluster": clust_loss.item(),
         "smooth_s": sm_spatial.item(), "smooth_f": sm_feat_total.item(),
+        "balance": balance_total.item(),
     }
     return total, loss_dict

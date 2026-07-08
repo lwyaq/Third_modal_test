@@ -45,7 +45,7 @@ FIXED_PARAMS = {
     "dec_stability_min_epochs": 50, "max_spatial_edges": 3484,
     "gamma_saturation": 0.99, "edge_evolve_ratio": 0.05, "min_edges": 80, "delta_edges": 15,
     "allow_edge_add": True, "use_hsl_spatial": True, "clustering_method": "mclust",
-    "use_dynamic_feature": True, "seed": 42,
+    "use_dynamic_feature": True, "seed": 42, "lambda_balance": 0.01,
 }
 
 MAX_TRIALS = 100
@@ -101,6 +101,7 @@ def run_trial(params, data_bundle):
         device=device, lambda_cluster=params["lambda_cluster"],
         lambda_smooth=params["lambda_smooth"],
         lambda_recon=params["lambda_recon"],
+        lambda_balance=params["lambda_balance"],
         max_spatial_edges=params["max_spatial_edges"],
         use_hsl_spatial=params["use_hsl_spatial"],
         use_dynamic_feature=params["use_dynamic_feature"],

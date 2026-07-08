@@ -71,6 +71,7 @@ def parse_args():
 
     p.add_argument("--lambda_recon", type=float, default=0.5)
     p.add_argument("--lambda_cluster", type=float, default=1.0)
+    p.add_argument("--lambda_balance", type=float, default=0.01)
     p.add_argument("--lambda_smooth", type=float, default=0.005)
     p.add_argument("--max_spatial_edges", type=int, default=2129)
 
@@ -168,6 +169,7 @@ def main():
         lambda_cluster=args.lambda_cluster,
         lambda_smooth=args.lambda_smooth,
         lambda_recon=args.lambda_recon,
+        lambda_balance=args.lambda_balance,
         max_spatial_edges=args.max_spatial_edges,
         use_hsl_spatial=args.use_hsl_spatial,
         use_dynamic_feature=args.use_dynamic_feature,
