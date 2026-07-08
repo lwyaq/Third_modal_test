@@ -44,7 +44,7 @@ FIXED_PARAMS = {
     "dec_stability_patience": 5, "dec_stability_tol": 0.003,
     "dec_stability_min_epochs": 50, "max_spatial_edges": 3484,
     "gamma_saturation": 0.99, "edge_evolve_ratio": 0.05, "min_edges": 80, "delta_edges": 15,
-    "allow_edge_add": True, "use_hsl_spatial": True,
+    "allow_edge_add": True, "use_hsl_spatial": True, "clustering_method": "mclust",
     "use_dynamic_feature": True, "seed": 42,
 }
 
@@ -115,6 +115,7 @@ def run_trial(params, data_bundle):
         hsl_residual_strength=params["hsl_residual_strength"],
         allow_edge_add=params["allow_edge_add"],
         freeze_edges_after_warmup=params["freeze_edges_after_warmup"],
+        clustering_method=params["clustering_method"],
         dec_stability_patience=params["dec_stability_patience"],
         dec_stability_tol=params["dec_stability_tol"],
         dec_stability_min_epochs=params["dec_stability_min_epochs"],

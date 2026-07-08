@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import scipy.sparse as sp
+import anndata as ad
 import torch
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -25,6 +26,7 @@ from modal2.hypergraph import (
     compute_expression_weighted_incidence,
 )
 from modal2.utils import compute_morans_i
+from modal2.preprocessing import clustering as preprocessing_clustering
 
 
 def mclust_via_r(embedding, n_clusters, seed=42):
@@ -108,6 +110,7 @@ class DHGNNTrainer:
         n_feature_edges=None, k_nodes=None, k_edges=None,
         init_edge_features=None,
         modality_names=None,
+        clustering_method="mclust",
     ):
         self.coords = coords
         self.modality_data = modality_data
@@ -116,6 +119,7 @@ class DHGNNTrainer:
         self.device = torch.device(device)
         self.init_edge_features = init_edge_features
         self.modality_names = modality_names
+        self.clustering_method = clustering_method
 
         self.modality_data = [np.asarray(d, dtype=np.float32) for d in modality_data]
         self.n_nodes = self.modality_data[0].shape[0]
@@ -242,6 +246,7 @@ class DHGNNTrainer:
               f"legacy_delta={self.delta_edges}, beta={self.beta_saturation}, "
               f"gamma={self.gamma_saturation}, allow_add={self.allow_edge_add}, "
               f"freeze_after_warmup={self.freeze_edges_after_warmup}")
+        print(f"  Evaluation clustering: {self.clustering_method}")
         print(f"  Fusion: discrepancy-aware intra-modal attention → sigmoid cross-modal gate")
         print(f"  Warmup: {self.warmup_epochs} → DEC KL")
         if self.dec_stability_patience > 0:
@@ -475,8 +480,7 @@ class DHGNNTrainer:
     def _evaluate(self, model, modality_tensors):
         outputs = self._forward(model, modality_tensors)
         embedding = outputs["embedding"].cpu().numpy()
-        km = KMeans(n_clusters=self.n_classes, n_init=20, random_state=self.seed, max_iter=500)
-        predictions = km.fit_predict(embedding)
+        predictions = self._cluster_embedding(embedding, method=self.clustering_method)
         metrics = {"embedding": embedding, "predictions": predictions}
         if self.labels is not None:
             metrics["ari"] = adjusted_rand_score(self.labels, predictions)
@@ -514,13 +518,24 @@ class DHGNNTrainer:
         if self.predictions is not None: return self.predictions
         raise RuntimeError("Call .fit() first.")
 
+    def _cluster_embedding(self, embedding, method=None, n_clusters=None):
+        method = method or self.clustering_method
+        n_cls = n_clusters or self.n_classes
+        if method == "kmeans":
+            return KMeans(n_clusters=n_cls, n_init=20, random_state=self.seed, max_iter=500).fit_predict(embedding)
+        adata = ad.AnnData(np.zeros((embedding.shape[0], 1), dtype=np.float32))
+        adata.obsm["DHGNN"] = embedding
+        labels = preprocessing_clustering(
+            adata, key="DHGNN", add_key="DHGNN_cluster",
+            n_clusters=n_cls, method=method, random_state=self.seed,
+        )
+        if labels is None:
+            labels = adata.obs["DHGNN_cluster"].astype(str).astype(int).to_numpy()
+        return np.asarray(labels, dtype=int)
+
     def recluster(self, method="mclust", n_clusters=None):
         if self.embeddings is None: raise RuntimeError("Call .fit() first.")
-        n_cls = n_clusters or self.n_classes
-        if method == "mclust":
-            predictions = mclust_via_r(self.embeddings, n_cls, self.seed)
-        else:
-            predictions = KMeans(n_clusters=n_cls, n_init=20, random_state=self.seed).fit_predict(self.embeddings)
+        predictions = self._cluster_embedding(self.embeddings, method=method, n_clusters=n_clusters)
         self.predictions = predictions
         metrics = {"embedding": self.embeddings, "predictions": predictions}
         if self.labels is not None:

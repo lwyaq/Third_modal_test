@@ -76,6 +76,7 @@ def parse_args():
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto")
+    p.add_argument("--clustering_method", type=str, default="mclust", choices=["mclust", "kmeans"])
 
     return p.parse_args()
 
@@ -181,6 +182,7 @@ def main():
         hsl_residual_strength=args.hsl_residual_strength,
         allow_edge_add=args.allow_edge_add,
         freeze_edges_after_warmup=args.freeze_edges_after_warmup,
+        clustering_method=args.clustering_method,
     )
 
     metrics = trainer.fit()
