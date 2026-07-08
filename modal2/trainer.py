@@ -321,10 +321,12 @@ class DHGNNTrainer:
                 for log in edge_logs:
                     name = names[log["modality"]] if log["modality"] < len(names) else f"Modality_{log['modality']}"
                     extra = ""
-                    if "merged" in log or "split" in log:
+                    if "merged" in log or "split" in log or "pruned" in log:
                         extra = (
-                            f", merged={log.get('merged', 0)}, split={log.get('split', 0)}, "
-                            f"before={log.get('n_edges_before', log['n_edges'])}"
+                            f", merged={log.get('merged', 0)}, pruned={log.get('pruned', 0)}, "
+                            f"split={log.get('split', 0)}, "
+                            f"before={log.get('n_edges_before', log['n_edges'])}, "
+                            f"target={log.get('target_edges', log['n_edges'])}"
                         )
                     print(f"  {name}: action={log['action']}, S={log['saturation']:.3f}, "
                           f"empty={log['empty']}, n_edges={log['n_edges']}{extra}")

@@ -236,13 +236,17 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
         raw_node_features: Optional[torch.Tensor] = None,
         evolve_ratio: float = 0.05,
     ):
-        """Evolve feature hyperedges with a low-parameter merge-split rule.
+        """Adaptively compress or refine dynamic feature hyperedges.
 
-        The primary path is ranking-based and budget-neutral: merge the most
-        redundant prototype pairs and spend the released edge budget by
-        splitting high-usage, internally heterogeneous hyperedges.  If the
-        caller does not provide node/raw features (for legacy entry points), the
-        previous fixed-step saturation adjustment is used as a fallback.
+        Feature hyperedges are initialized from cells, so the initial prototype
+        count can be far larger than the biological feature patterns needed by
+        the model.  Instead of preserving that initial budget, this routine
+        estimates a compact target budget from active-edge saturation, then
+        moves toward it with a bounded per-step evolution ratio.  Redundant
+        high-usage prototypes are merged first; any remaining compression is
+        done by pruning low-importance prototypes.  Splitting is reserved for
+        the opposite case where the active set is saturated and additional
+        capacity is justified.
         """
         device = self.edge_raw_features.device
         usage = self.last_edge_usage
@@ -253,81 +257,107 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
         non_empty = int((usage > 0).sum().item())
         empty = n_edges - non_empty
         saturation = non_empty / max(n_edges, 1)
+        target_saturation = 0.85
+        target_edges = int(torch.ceil(torch.tensor(non_empty / target_saturation)).item()) if non_empty else self.min_edges
+        target_edges = max(self.min_edges, min(self.max_edges, target_edges))
+        max_ops = max(1, int(round(float(evolve_ratio) * n_edges)))
 
         if node_embeddings is None or raw_node_features is None or self.last_cols is None:
             action = "keep"
-            if saturation < beta and n_edges > self.min_edges:
-                keep_count = max(self.min_edges, n_edges - delta_edges)
+            if n_edges > target_edges:
+                keep_count = max(target_edges, n_edges - max_ops)
                 keep_idx = torch.argsort(usage, descending=True)[:keep_count].sort().values
                 self.edge_raw_features = nn.Parameter(self.edge_raw_features.data[keep_idx].clone().to(device))
-                action = "prune"
+                action = "adaptive_prune"
             elif saturation > gamma and allow_add and n_edges < self.max_edges:
-                add_count = min(delta_edges, self.max_edges - n_edges)
+                add_count = min(max_ops, self.max_edges - n_edges)
                 source = torch.randint(0, n_edges, (add_count,), device=device)
                 scale = self.edge_raw_features.data.std(dim=0, keepdim=True).clamp_min(1e-3)
                 noise = 0.01 * torch.randn(add_count, self.raw_dim, device=device) * scale
                 added = self.edge_raw_features.data[source] + noise
                 self.edge_raw_features = nn.Parameter(torch.cat([self.edge_raw_features.data, added], dim=0))
                 action = "add"
-            return {"action": action, "saturation": saturation, "empty": empty, "n_edges": self.n_edges}
+            return {
+                "action": action, "saturation": saturation, "empty": empty,
+                "n_edges": self.n_edges, "n_edges_before": n_edges,
+                "target_edges": target_edges, "merged": 0, "pruned": max(0, n_edges - self.n_edges),
+                "split": 0, "evolve_ratio": float(evolve_ratio),
+            }
 
         node_embeddings = node_embeddings.detach().to(device)
         raw_node_features = raw_node_features.detach().to(device)
         usage = usage.to(device)
         cols = self.last_cols.to(device)
+        vals = self.last_vals.to(device) if self.last_vals is not None else torch.ones_like(cols, dtype=torch.float32)
         rows = self.last_rows.to(device) if self.last_rows is not None else None
 
-        max_ops = max(1, int(round(float(evolve_ratio) * n_edges)))
-        max_merges = min(max_ops, max(0, n_edges - self.min_edges))
+        attention_mass = torch.zeros(n_edges, device=device)
+        attention_mass.scatter_add_(0, cols, vals.float())
+        importance = usage.float() + attention_mass / attention_mass.max().clamp_min(1e-8)
+
         merge_pairs: List[Tuple[int, int]] = []
         used_edges = set()
-
-        if max_merges > 0 and n_edges > 1:
-            proto = F.normalize(self.edge_raw_features.data, p=2, dim=1)
-            sim = proto @ proto.T
-            sim.fill_diagonal_(-float("inf"))
-            candidate_count = min(sim.numel(), max_merges * 20 + n_edges)
-            flat_vals, flat_idx = torch.topk(sim.reshape(-1), k=candidate_count)
-            for score, flat in zip(flat_vals.tolist(), flat_idx.tolist()):
-                if score == -float("inf"):
-                    break
-                i = flat // n_edges
-                j = flat % n_edges
-                if i == j or i in used_edges or j in used_edges:
-                    continue
-                if usage[i] <= 0 or usage[j] <= 0:
-                    continue
-                merge_pairs.append((i, j))
-                used_edges.add(i)
-                used_edges.add(j)
-                if len(merge_pairs) >= max_merges:
-                    break
-
-        split_budget = len(merge_pairs)
+        prune_edges = set()
         split_edges: List[int] = []
-        if split_budget > 0 and rows is not None:
-            min_split_size = max(4, int(0.005 * node_embeddings.shape[0]))
-            heterogeneity = torch.full((n_edges,), -float("inf"), device=device)
-            usage_f = usage.float()
-            usage_norm = usage_f / usage_f.max().clamp_min(1.0)
-            removed_for_merge = set(used_edges)
-            for edge_idx in range(n_edges):
-                if edge_idx in removed_for_merge or int(usage[edge_idx].item()) < min_split_size:
-                    continue
-                node_idx = rows[cols == edge_idx]
-                if node_idx.numel() < min_split_size:
-                    continue
-                z = node_embeddings[node_idx]
-                variance = ((z - z.mean(dim=0, keepdim=True)) ** 2).sum(dim=1).mean()
-                heterogeneity[edge_idx] = usage_norm[edge_idx] * variance
-            valid = torch.isfinite(heterogeneity)
-            if valid.any():
-                k_split = min(split_budget, int(valid.sum().item()), max(0, self.max_edges - (n_edges - len(merge_pairs))))
-                if k_split > 0:
+
+        if n_edges > target_edges:
+            target_after = max(target_edges, n_edges - max_ops)
+            remove_budget = min(n_edges - target_after, max(0, n_edges - self.min_edges))
+            if remove_budget > 0 and n_edges > 1:
+                proto = F.normalize(self.edge_raw_features.data, p=2, dim=1)
+                sim = proto @ proto.T
+                sim.fill_diagonal_(-float("inf"))
+                candidate_count = min(sim.numel(), remove_budget * 20 + n_edges)
+                flat_vals, flat_idx = torch.topk(sim.reshape(-1), k=candidate_count)
+                for score, flat in zip(flat_vals.tolist(), flat_idx.tolist()):
+                    if score == -float("inf"):
+                        break
+                    i = flat // n_edges
+                    j = flat % n_edges
+                    if i == j or i in used_edges or j in used_edges:
+                        continue
+                    if usage[i] <= 0 or usage[j] <= 0:
+                        continue
+                    merge_pairs.append((i, j))
+                    used_edges.add(i)
+                    used_edges.add(j)
+                    if len(merge_pairs) >= remove_budget:
+                        break
+
+            remaining_remove = max(0, remove_budget - len(merge_pairs))
+            if remaining_remove > 0:
+                candidate_scores = importance.clone()
+                for edge_idx in used_edges:
+                    candidate_scores[edge_idx] = float("inf")
+                # Prefer removing empty and low-importance prototypes, but never
+                # go below the current step's target_after budget.
+                removable = torch.isfinite(candidate_scores)
+                k_prune = min(remaining_remove, int(removable.sum().item()))
+                if k_prune > 0:
+                    prune_edges = set(torch.topk(-candidate_scores, k=k_prune).indices.tolist())
+
+        elif allow_add and saturation > gamma and n_edges < target_edges:
+            add_budget = min(target_edges - n_edges, max_ops, self.max_edges - n_edges)
+            if add_budget > 0 and rows is not None:
+                min_split_size = max(4, int(0.005 * node_embeddings.shape[0]))
+                heterogeneity = torch.full((n_edges,), -float("inf"), device=device)
+                usage_norm = usage.float() / usage.float().max().clamp_min(1.0)
+                for edge_idx in range(n_edges):
+                    if int(usage[edge_idx].item()) < min_split_size:
+                        continue
+                    node_idx = rows[cols == edge_idx]
+                    if node_idx.numel() < min_split_size:
+                        continue
+                    z = node_embeddings[node_idx]
+                    variance = ((z - z.mean(dim=0, keepdim=True)) ** 2).sum(dim=1).mean()
+                    heterogeneity[edge_idx] = usage_norm[edge_idx] * variance
+                valid = torch.isfinite(heterogeneity)
+                if valid.any():
+                    k_split = min(add_budget, int(valid.sum().item()))
                     split_edges = torch.topk(heterogeneity, k=k_split).indices.tolist()
 
         split_set = set(split_edges)
-        removed = set(used_edges) | split_set
+        removed = set(used_edges) | prune_edges | split_set
         new_edges: List[torch.Tensor] = []
         for edge_idx in range(n_edges):
             if edge_idx not in removed:
@@ -346,8 +376,6 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
         for edge_idx in split_edges:
             node_idx = rows[cols == edge_idx]
             if node_idx.numel() < 2 * min_child_size:
-                # Fall back to keeping the original prototype if the selected
-                # edge cannot be split into two stable child groups.
                 new_edges.append(self.edge_raw_features.data[edge_idx])
                 continue
             z = node_embeddings[node_idx]
@@ -378,14 +406,22 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
         if new_edges:
             self.edge_raw_features = nn.Parameter(torch.stack(new_edges, dim=0).to(device))
 
-        action = "merge_split" if (merged_count or split_count) else "keep"
+        pruned_count = len(prune_edges)
+        if merged_count or pruned_count:
+            action = "adaptive_compress"
+        elif split_count:
+            action = "adaptive_split"
+        else:
+            action = "keep"
         return {
             "action": action,
             "saturation": saturation,
             "empty": empty,
             "n_edges": self.n_edges,
             "n_edges_before": n_edges,
+            "target_edges": target_edges,
             "merged": merged_count,
+            "pruned": pruned_count,
             "split": split_count,
             "evolve_ratio": float(evolve_ratio),
         }
