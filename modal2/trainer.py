@@ -246,7 +246,7 @@ class DHGNNTrainer:
               f"legacy_delta={self.delta_edges}, beta={self.beta_saturation}, "
               f"gamma={self.gamma_saturation}, allow_add={self.allow_edge_add}, "
               f"freeze_after_warmup={self.freeze_edges_after_warmup}")
-        print(f"  Evaluation clustering: {self.clustering_method}")
+        print(f"  Training eval clustering: kmeans; final clustering: {self.clustering_method}")
         print(f"  Fusion: discrepancy-aware intra-modal attention → sigmoid cross-modal gate")
         print(f"  Warmup: {self.warmup_epochs} → DEC KL")
         if self.dec_stability_patience > 0:
@@ -349,7 +349,7 @@ class DHGNNTrainer:
             if (epoch + 1) % 5 == 0 or epoch == 0:
                 model.eval()
                 with torch.no_grad():
-                    metrics = self._evaluate(model, modality_tensors)
+                    metrics = self._evaluate(model, modality_tensors, cluster_method="kmeans")
 
                 current_loss = loss_dict["total"]
                 if current_loss < best_loss - 1e-6:
@@ -418,7 +418,7 @@ class DHGNNTrainer:
 
         model.eval()
         with torch.no_grad():
-            metrics = self._evaluate(model, modality_tensors)
+            metrics = self._evaluate(model, modality_tensors, cluster_method=self.clustering_method)
 
         print(f"\nBest loss: {best_loss:.4f} at epoch {best_epoch+1}")
         if "ari" in metrics:
@@ -477,10 +477,10 @@ class DHGNNTrainer:
         outputs = self._forward(model, modality_tensors)
         return outputs["cluster_logits"].argmax(dim=1).detach().cpu().numpy()
 
-    def _evaluate(self, model, modality_tensors):
+    def _evaluate(self, model, modality_tensors, cluster_method="kmeans"):
         outputs = self._forward(model, modality_tensors)
         embedding = outputs["embedding"].cpu().numpy()
-        predictions = self._cluster_embedding(embedding, method=self.clustering_method)
+        predictions = self._cluster_embedding(embedding, method=cluster_method)
         metrics = {"embedding": embedding, "predictions": predictions}
         if self.labels is not None:
             metrics["ari"] = adjusted_rand_score(self.labels, predictions)

@@ -191,7 +191,7 @@ def main():
 
     metrics = trainer.fit()
 
-    # --- Final evaluation (KMeans, already done in trainer) ---
+    # --- Final evaluation (mclust by default, already done in trainer) ---
     if labels is not None:
         predictions = trainer.get_predictions()
         final_metrics = evaluate_clustering(labels, predictions)
