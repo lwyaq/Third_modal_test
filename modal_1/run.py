@@ -42,16 +42,36 @@ def parse_args():
     p.add_argument("--n_feature_edges", type=int, default=60)
     p.add_argument("--k_nodes", type=int, default=15)
     p.add_argument("--k_edges", type=int, default=8)
+    p.add_argument("--use_hsl_spatial", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--use_dynamic_feature", action=argparse.BooleanOptionalAction, default=True,
+                   help="Keep dynamic prototype feature hypergraphs enabled; disabling the removed static gene-as-hyperedge path is unsupported")
+    p.add_argument("--edge_adjust_interval", type=int, default=10)
+    p.add_argument("--delta_edges", type=int, default=20)
+    p.add_argument("--beta_saturation", type=float, default=0.90)
+    p.add_argument("--gamma_saturation", type=float, default=0.98)
+    p.add_argument("--topk_edges", type=int, default=3)
+    p.add_argument("--min_edges", type=int, default=100)
+    p.add_argument("--hsl_residual_strength", type=float, default=0.5)
+    p.add_argument("--allow_edge_add", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--freeze_edges_after_warmup", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--dropout", type=float, default=0.3)
 
     p.add_argument("--lr", type=float, default=0.001)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--epochs", type=int, default=500)
     p.add_argument("--patience", type=int, default=50)
+    p.add_argument("--warmup_epochs", type=int, default=80)
+    p.add_argument("--dec_stability_patience", type=int, default=3,
+                   help="Enable DEC assignment stability stopping after this many stable checks; 0 disables it")
+    p.add_argument("--dec_stability_tol", type=float, default=0.005,
+                   help="Maximum fraction of changed DEC assignments considered stable")
+    p.add_argument("--dec_stability_min_epochs", type=int, default=20,
+                   help="Minimum number of DEC epochs before stability stopping can trigger")
 
+    p.add_argument("--lambda_recon", type=float, default=0.5)
     p.add_argument("--lambda_cluster", type=float, default=1.0)
-    p.add_argument("--lambda_smooth", type=float, default=0.1)
-    p.add_argument("--max_spatial_edges", type=int, default=1500)
+    p.add_argument("--lambda_smooth", type=float, default=0.001)
+    p.add_argument("--max_spatial_edges", type=int, default=2129)
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto")
@@ -137,11 +157,28 @@ def main():
         weight_decay=args.weight_decay,
         epochs=args.epochs,
         patience=args.patience,
+        warmup_epochs=args.warmup_epochs,
+        dec_stability_patience=args.dec_stability_patience,
+        dec_stability_tol=args.dec_stability_tol,
+        dec_stability_min_epochs=args.dec_stability_min_epochs,
         seed=args.seed,
         device=device,
         lambda_cluster=args.lambda_cluster,
         lambda_smooth=args.lambda_smooth,
+        lambda_recon=args.lambda_recon,
         max_spatial_edges=args.max_spatial_edges,
+        use_hsl_spatial=args.use_hsl_spatial,
+        use_dynamic_feature=args.use_dynamic_feature,
+        edge_adjust_interval=args.edge_adjust_interval,
+        delta_edges=args.delta_edges,
+        beta_saturation=args.beta_saturation,
+        gamma_saturation=args.gamma_saturation,
+        topk_edges=args.topk_edges,
+        min_edges=args.min_edges,
+        max_edges=coords.shape[0],
+        hsl_residual_strength=args.hsl_residual_strength,
+        allow_edge_add=args.allow_edge_add,
+        freeze_edges_after_warmup=args.freeze_edges_after_warmup,
     )
 
     metrics = trainer.fit()
