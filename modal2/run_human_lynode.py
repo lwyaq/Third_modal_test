@@ -51,6 +51,7 @@ def parse_args():
     p.add_argument("--delta_edges", type=int, default=20)
     p.add_argument("--beta_saturation", type=float, default=0.6)
     p.add_argument("--gamma_saturation", type=float, default=0.98)
+    p.add_argument("--edge_evolve_ratio", type=float, default=0.05)
     p.add_argument("--topk_edges", type=int, default=3)
     p.add_argument("--min_edges", type=int, default=100)
     p.add_argument("--hsl_residual_strength", type=float, default=0.5)
@@ -176,6 +177,7 @@ def main():
         delta_edges=args.delta_edges,
         beta_saturation=args.beta_saturation,
         gamma_saturation=args.gamma_saturation,
+        edge_evolve_ratio=args.edge_evolve_ratio,
         topk_edges=args.topk_edges,
         min_edges=args.min_edges,
         max_edges=coords.shape[0],

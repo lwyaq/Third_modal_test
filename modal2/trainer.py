@@ -97,6 +97,7 @@ class DHGNNTrainer:
         use_hsl_spatial=True, use_dynamic_feature=True,
         edge_adjust_interval=10, delta_edges=20,
         beta_saturation=0.90, gamma_saturation=0.98,
+        edge_evolve_ratio=0.05,
         topk_edges=3, min_edges=100, max_edges=None,
         hsl_residual_strength=0.5,
         allow_edge_add=True,
@@ -143,6 +144,7 @@ class DHGNNTrainer:
         self.delta_edges = delta_edges
         self.beta_saturation = beta_saturation
         self.gamma_saturation = gamma_saturation
+        self.edge_evolve_ratio = edge_evolve_ratio
         self.topk_edges = topk_edges
         self.min_edges = min_edges
         self.max_edges = max_edges or self.n_nodes
@@ -235,9 +237,10 @@ class DHGNNTrainer:
         print(f"  Losses: recon({self.lambda_recon}) + cluster({self.lambda_cluster}) "
               f"+ smooth({self.lambda_smooth})")
         print(f"  HSL spatial: {self.use_hsl_spatial}; dynamic feature: {self.use_dynamic_feature}")
-        print(f"  Edge adjustment: interval={self.edge_adjust_interval}, delta={self.delta_edges}, "
-              f"beta={self.beta_saturation}, gamma={self.gamma_saturation}, "
-              f"allow_add={self.allow_edge_add}, "
+        print(f"  Edge evolution: interval={self.edge_adjust_interval}, "
+              f"evolve_ratio={self.edge_evolve_ratio}, "
+              f"legacy_delta={self.delta_edges}, beta={self.beta_saturation}, "
+              f"gamma={self.gamma_saturation}, allow_add={self.allow_edge_add}, "
               f"freeze_after_warmup={self.freeze_edges_after_warmup}")
         print(f"  Fusion: discrepancy-aware intra-modal attention → sigmoid cross-modal gate")
         print(f"  Warmup: {self.warmup_epochs} → DEC KL")
@@ -307,15 +310,24 @@ class DHGNNTrainer:
             if can_adjust_edges:
                 edge_logs = model.adjust_dynamic_feature_edges(
                     beta=self.beta_saturation, gamma=self.gamma_saturation,
-                    delta_edges=self.delta_edges, allow_add=self.allow_edge_add
+                    delta_edges=self.delta_edges, allow_add=self.allow_edge_add,
+                    modality_node_embeddings=outputs["mod_feature_pre"],
+                    raw_node_features=modality_tensors,
+                    evolve_ratio=self.edge_evolve_ratio,
                 )
                 optim_stats = self._refresh_optimizer_params(optimizer, model)
                 names = self.modality_names or [f"Modality_{i}" for i in range(len(edge_logs))]
                 print(f"Epoch {epoch+1} dynamic edge adjustment:")
                 for log in edge_logs:
                     name = names[log["modality"]] if log["modality"] < len(names) else f"Modality_{log['modality']}"
+                    extra = ""
+                    if "merged" in log or "split" in log:
+                        extra = (
+                            f", merged={log.get('merged', 0)}, split={log.get('split', 0)}, "
+                            f"before={log.get('n_edges_before', log['n_edges'])}"
+                        )
                     print(f"  {name}: action={log['action']}, S={log['saturation']:.3f}, "
-                          f"empty={log['empty']}, n_edges={log['n_edges']}")
+                          f"empty={log['empty']}, n_edges={log['n_edges']}{extra}")
                 if optim_stats["added"] or optim_stats["removed"]:
                     print(
                         f"  Optimizer params refreshed without resetting Adam/scheduler "

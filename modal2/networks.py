@@ -192,6 +192,9 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
         self.min_edges = min_edges
         self.max_edges = max_edges or init.shape[0]
         self.last_edge_usage: Optional[torch.Tensor] = None
+        self.last_rows: Optional[torch.Tensor] = None
+        self.last_cols: Optional[torch.Tensor] = None
+        self.last_vals: Optional[torch.Tensor] = None
         self.last_saturation = 0.0
 
     @property
@@ -216,34 +219,176 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
         vals = vals.reshape(-1)
         usage = torch.bincount(cols.detach(), minlength=n_edges).to(node_embeddings.device)
         self.last_edge_usage = usage
+        self.last_rows = rows.detach()
+        self.last_cols = cols.detach()
+        self.last_vals = vals.detach()
         self.last_saturation = float((usage > 0).float().mean().detach().cpu())
         return rows, cols, vals, n_edges
 
     @torch.no_grad()
-    def adjust_edges(self, beta=0.90, gamma=0.98, delta_edges=20, allow_add=True):
+    def adjust_edges(
+        self,
+        beta=0.90,
+        gamma=0.98,
+        delta_edges=20,
+        allow_add=True,
+        node_embeddings: Optional[torch.Tensor] = None,
+        raw_node_features: Optional[torch.Tensor] = None,
+        evolve_ratio: float = 0.05,
+    ):
+        """Evolve feature hyperedges with a low-parameter merge-split rule.
+
+        The primary path is ranking-based and budget-neutral: merge the most
+        redundant prototype pairs and spend the released edge budget by
+        splitting high-usage, internally heterogeneous hyperedges.  If the
+        caller does not provide node/raw features (for legacy entry points), the
+        previous fixed-step saturation adjustment is used as a fallback.
+        """
         device = self.edge_raw_features.device
         usage = self.last_edge_usage
         n_edges = self.n_edges
         if usage is None:
             return {"action": "skip", "saturation": 0.0, "empty": n_edges, "n_edges": n_edges}
+
         non_empty = int((usage > 0).sum().item())
         empty = n_edges - non_empty
         saturation = non_empty / max(n_edges, 1)
-        action = "keep"
-        if saturation < beta and n_edges > self.min_edges:
-            keep_count = max(self.min_edges, n_edges - delta_edges)
-            keep_idx = torch.argsort(usage, descending=True)[:keep_count].sort().values
-            self.edge_raw_features = nn.Parameter(self.edge_raw_features.data[keep_idx].clone().to(device))
-            action = "prune"
-        elif saturation > gamma and allow_add and n_edges < self.max_edges:
-            add_count = min(delta_edges, self.max_edges - n_edges)
-            source = torch.randint(0, n_edges, (add_count,), device=device)
-            scale = self.edge_raw_features.data.std(dim=0, keepdim=True).clamp_min(1e-3)
-            noise = 0.01 * torch.randn(add_count, self.raw_dim, device=device) * scale
-            added = self.edge_raw_features.data[source] + noise
-            self.edge_raw_features = nn.Parameter(torch.cat([self.edge_raw_features.data, added], dim=0))
-            action = "add"
-        return {"action": action, "saturation": saturation, "empty": empty, "n_edges": self.n_edges}
+
+        if node_embeddings is None or raw_node_features is None or self.last_cols is None:
+            action = "keep"
+            if saturation < beta and n_edges > self.min_edges:
+                keep_count = max(self.min_edges, n_edges - delta_edges)
+                keep_idx = torch.argsort(usage, descending=True)[:keep_count].sort().values
+                self.edge_raw_features = nn.Parameter(self.edge_raw_features.data[keep_idx].clone().to(device))
+                action = "prune"
+            elif saturation > gamma and allow_add and n_edges < self.max_edges:
+                add_count = min(delta_edges, self.max_edges - n_edges)
+                source = torch.randint(0, n_edges, (add_count,), device=device)
+                scale = self.edge_raw_features.data.std(dim=0, keepdim=True).clamp_min(1e-3)
+                noise = 0.01 * torch.randn(add_count, self.raw_dim, device=device) * scale
+                added = self.edge_raw_features.data[source] + noise
+                self.edge_raw_features = nn.Parameter(torch.cat([self.edge_raw_features.data, added], dim=0))
+                action = "add"
+            return {"action": action, "saturation": saturation, "empty": empty, "n_edges": self.n_edges}
+
+        node_embeddings = node_embeddings.detach().to(device)
+        raw_node_features = raw_node_features.detach().to(device)
+        usage = usage.to(device)
+        cols = self.last_cols.to(device)
+        rows = self.last_rows.to(device) if self.last_rows is not None else None
+
+        max_ops = max(1, int(round(float(evolve_ratio) * n_edges)))
+        max_merges = min(max_ops, max(0, n_edges - self.min_edges))
+        merge_pairs: List[Tuple[int, int]] = []
+        used_edges = set()
+
+        if max_merges > 0 and n_edges > 1:
+            proto = F.normalize(self.edge_raw_features.data, p=2, dim=1)
+            sim = proto @ proto.T
+            sim.fill_diagonal_(-float("inf"))
+            candidate_count = min(sim.numel(), max_merges * 20 + n_edges)
+            flat_vals, flat_idx = torch.topk(sim.reshape(-1), k=candidate_count)
+            for score, flat in zip(flat_vals.tolist(), flat_idx.tolist()):
+                if score == -float("inf"):
+                    break
+                i = flat // n_edges
+                j = flat % n_edges
+                if i == j or i in used_edges or j in used_edges:
+                    continue
+                if usage[i] <= 0 or usage[j] <= 0:
+                    continue
+                merge_pairs.append((i, j))
+                used_edges.add(i)
+                used_edges.add(j)
+                if len(merge_pairs) >= max_merges:
+                    break
+
+        split_budget = len(merge_pairs)
+        split_edges: List[int] = []
+        if split_budget > 0 and rows is not None:
+            min_split_size = max(4, int(0.005 * node_embeddings.shape[0]))
+            heterogeneity = torch.full((n_edges,), -float("inf"), device=device)
+            usage_f = usage.float()
+            usage_norm = usage_f / usage_f.max().clamp_min(1.0)
+            removed_for_merge = set(used_edges)
+            for edge_idx in range(n_edges):
+                if edge_idx in removed_for_merge or int(usage[edge_idx].item()) < min_split_size:
+                    continue
+                node_idx = rows[cols == edge_idx]
+                if node_idx.numel() < min_split_size:
+                    continue
+                z = node_embeddings[node_idx]
+                variance = ((z - z.mean(dim=0, keepdim=True)) ** 2).sum(dim=1).mean()
+                heterogeneity[edge_idx] = usage_norm[edge_idx] * variance
+            valid = torch.isfinite(heterogeneity)
+            if valid.any():
+                k_split = min(split_budget, int(valid.sum().item()), max(0, self.max_edges - (n_edges - len(merge_pairs))))
+                if k_split > 0:
+                    split_edges = torch.topk(heterogeneity, k=k_split).indices.tolist()
+
+        split_set = set(split_edges)
+        removed = set(used_edges) | split_set
+        new_edges: List[torch.Tensor] = []
+        for edge_idx in range(n_edges):
+            if edge_idx not in removed:
+                new_edges.append(self.edge_raw_features.data[edge_idx])
+
+        merged_count = 0
+        for i, j in merge_pairs:
+            wi = usage[i].float().clamp_min(1.0)
+            wj = usage[j].float().clamp_min(1.0)
+            merged = (wi * self.edge_raw_features.data[i] + wj * self.edge_raw_features.data[j]) / (wi + wj)
+            new_edges.append(merged)
+            merged_count += 1
+
+        split_count = 0
+        min_child_size = max(2, int(0.0025 * node_embeddings.shape[0]))
+        for edge_idx in split_edges:
+            node_idx = rows[cols == edge_idx]
+            if node_idx.numel() < 2 * min_child_size:
+                # Fall back to keeping the original prototype if the selected
+                # edge cannot be split into two stable child groups.
+                new_edges.append(self.edge_raw_features.data[edge_idx])
+                continue
+            z = node_embeddings[node_idx]
+            center = z.mean(dim=0, keepdim=True)
+            first = torch.argmax(((z - center) ** 2).sum(dim=1))
+            second = torch.argmax(((z - z[first:first + 1]) ** 2).sum(dim=1))
+            centers = torch.stack([z[first], z[second]], dim=0)
+            labels = None
+            for _ in range(5):
+                dist = torch.cdist(z, centers)
+                labels = torch.argmin(dist, dim=1)
+                for c in range(2):
+                    mask = labels == c
+                    if mask.any():
+                        centers[c] = z[mask].mean(dim=0)
+            if labels is None:
+                new_edges.append(self.edge_raw_features.data[edge_idx])
+                continue
+            child0 = node_idx[labels == 0]
+            child1 = node_idx[labels == 1]
+            if child0.numel() < min_child_size or child1.numel() < min_child_size:
+                new_edges.append(self.edge_raw_features.data[edge_idx])
+                continue
+            new_edges.append(raw_node_features[child0].mean(dim=0))
+            new_edges.append(raw_node_features[child1].mean(dim=0))
+            split_count += 1
+
+        if new_edges:
+            self.edge_raw_features = nn.Parameter(torch.stack(new_edges, dim=0).to(device))
+
+        action = "merge_split" if (merged_count or split_count) else "keep"
+        return {
+            "action": action,
+            "saturation": saturation,
+            "empty": empty,
+            "n_edges": self.n_edges,
+            "n_edges_before": n_edges,
+            "merged": merged_count,
+            "split": split_count,
+            "evolve_ratio": float(evolve_ratio),
+        }
 
 
 # ====================================================================== #
@@ -355,12 +500,20 @@ class DualBranchDHGNN(nn.Module):
                 nn.Linear(hidden_dim, dim),
             ))
 
-    def adjust_dynamic_feature_edges(self, beta=0.90, gamma=0.98, delta_edges=20, allow_add=True):
+    def adjust_dynamic_feature_edges(
+        self, beta=0.90, gamma=0.98, delta_edges=20, allow_add=True,
+        modality_node_embeddings=None, raw_node_features=None, evolve_ratio=0.05,
+    ):
         if not self.use_dynamic_feature:
             return []
         logs = []
         for m, builder in enumerate(self.dynamic_feature_builders):
-            log = builder.adjust_edges(beta=beta, gamma=gamma, delta_edges=delta_edges, allow_add=allow_add)
+            node_h = modality_node_embeddings[m] if modality_node_embeddings is not None else None
+            raw_x = raw_node_features[m] if raw_node_features is not None else None
+            log = builder.adjust_edges(
+                beta=beta, gamma=gamma, delta_edges=delta_edges, allow_add=allow_add,
+                node_embeddings=node_h, raw_node_features=raw_x, evolve_ratio=evolve_ratio,
+            )
             log["modality"] = m
             logs.append(log)
         return logs
