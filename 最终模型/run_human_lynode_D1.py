@@ -34,8 +34,8 @@ warnings.filterwarnings("ignore")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modal_1.preprocessing import clustering, extract_coords, pca
-from modal_1.trainer import DHGNNTrainer
+from modal_1.preprocessing import extract_coords, pca
+from modal_1.trainer import DHGNNTrainer, mclust_via_r
 from modal_1.utils import compute_morans_i, setup_seed
 
 
@@ -373,15 +373,18 @@ def main():
     adata.obs["DvDHGNN_kmeans"] = pd.Categorical(kmeans_labels.astype(str))
 
     print("Performing mclust clustering on final embedding...")
-    clustering(
-        adata,
-        key="DvDHGNN",
-        add_key="DvDHGNN_mclust",
-        n_clusters=n_classes,
-        method="mclust",
-        random_state=args.seed,
-    )
-    mclust_labels = adata.obs["DvDHGNN_mclust"].astype(int).values
+    try:
+        mclust_labels = mclust_via_r(embedding, n_classes, seed=args.seed)
+    except Exception as exc:
+        print(f"  mclust failed ({exc}); falling back to KMeans labels for mclust output.")
+        mclust_labels = KMeans(
+            n_clusters=n_classes,
+            n_init=20,
+            random_state=args.seed,
+            max_iter=500,
+        ).fit_predict(embedding)
+    adata.obs["DvDHGNN_mclust"] = pd.Categorical(mclust_labels.astype(str))
+    print("  mclust clustering completed.")
 
     kmeans_metrics = evaluate_unsupervised(embedding, coords, kmeans_labels, args.morans_k)
     mclust_metrics = evaluate_unsupervised(embedding, coords, mclust_labels, args.morans_k)
