@@ -1,5 +1,5 @@
 """
-modal_1 — Dynamic Dual-View Hypergraph Neural Network
+modal2 — Dynamic Dual-View Hypergraph Neural Network
 for Spatial Multi-Omics Clustering.
 
 Provides:
@@ -10,15 +10,15 @@ Provides:
   - utils:      evaluation metrics and helpers
 """
 
-from modal_1.hypergraph import (
+from modal2.hypergraph import (
     delaunay_star_edges,
     multi_scale_knn_edges,
     dbscan_edges,
     build_incidence,
     spectral_cluster_from_hypergraph,
 )
-from modal_1.networks import DualBranchDHGNN
-from modal_1.trainer import DHGNNTrainer
+from modal2.networks import DualBranchDHGNN
+from modal2.trainer import DHGNNTrainer
 
 __all__ = [
     "delaunay_star_edges",

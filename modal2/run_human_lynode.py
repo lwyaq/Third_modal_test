@@ -6,7 +6,7 @@ Dataset: data/human_lynode/
   - adata_ADT_with_annotation.h5ad
 
 Usage:
-    python -m modal_1.run_human_lynode [--epochs 500 --lr 0.001 --seed 42]
+    python -m modal2.run_human_lynode [--epochs 500 --lr 0.001 --seed 42]
 """
 
 from __future__ import annotations
@@ -24,9 +24,9 @@ warnings.filterwarnings("ignore")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modal_1.preprocessing import pca, extract_coords
-from modal_1.trainer import DHGNNTrainer
-from modal_1.utils import evaluate_clustering, print_metrics, label_encode, setup_seed
+from modal2.preprocessing import pca, extract_coords
+from modal2.trainer import DHGNNTrainer
+from modal2.utils import evaluate_clustering, print_metrics, label_encode, setup_seed
 
 
 def parse_args():
@@ -51,6 +51,7 @@ def parse_args():
     p.add_argument("--delta_edges", type=int, default=20)
     p.add_argument("--beta_saturation", type=float, default=0.6)
     p.add_argument("--gamma_saturation", type=float, default=0.98)
+    p.add_argument("--edge_evolve_ratio", type=float, default=0.05)
     p.add_argument("--topk_edges", type=int, default=3)
     p.add_argument("--min_edges", type=int, default=100)
     p.add_argument("--hsl_residual_strength", type=float, default=0.5)
@@ -69,11 +70,13 @@ def parse_args():
 
     p.add_argument("--lambda_recon", type=float, default=0.5)
     p.add_argument("--lambda_cluster", type=float, default=1.5)
+    p.add_argument("--lambda_balance", type=float, default=0.01)
     p.add_argument("--lambda_smooth", type=float, default=0.1)
     p.add_argument("--max_spatial_edges", type=int, default=3484)
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto")
+    p.add_argument("--clustering_method", type=str, default="mclust", choices=["mclust", "kmeans"])
 
     return p.parse_args()
 
@@ -169,6 +172,7 @@ def main():
         lambda_cluster=args.lambda_cluster,
         lambda_smooth=args.lambda_smooth,
         lambda_recon=args.lambda_recon,
+        lambda_balance=args.lambda_balance,
         max_spatial_edges=args.max_spatial_edges,
         use_hsl_spatial=args.use_hsl_spatial,
         use_dynamic_feature=args.use_dynamic_feature,
@@ -176,24 +180,29 @@ def main():
         delta_edges=args.delta_edges,
         beta_saturation=args.beta_saturation,
         gamma_saturation=args.gamma_saturation,
+        edge_evolve_ratio=args.edge_evolve_ratio,
         topk_edges=args.topk_edges,
         min_edges=args.min_edges,
         max_edges=coords.shape[0],
         hsl_residual_strength=args.hsl_residual_strength,
         allow_edge_add=args.allow_edge_add,
         freeze_edges_after_warmup=args.freeze_edges_after_warmup,
+        clustering_method=args.clustering_method,
         modality_names=["RNA", "Protein"],
     )
 
     metrics = trainer.fit()
 
-    # --- Final evaluation (KMeans, already done in trainer) ---
+    # --- Final evaluation (mclust by default, already done in trainer) ---
     if labels is not None:
         predictions = trainer.get_predictions()
         final_metrics = evaluate_clustering(labels, predictions)
         for k in ("morans_i_cluster", "morans_i_embedding_mean"):
             if k in metrics:
                 final_metrics[k] = metrics[k]
+        for k, v in metrics.items():
+            if k.startswith("final_kmeans_"):
+                final_metrics[k] = v
         print_metrics(final_metrics, title="DvDHGNN Human Lymph Node (RNA + Protein)")
     else:
         print("\n" + "=" * 50)

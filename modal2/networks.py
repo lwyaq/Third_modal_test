@@ -192,6 +192,9 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
         self.min_edges = min_edges
         self.max_edges = max_edges or init.shape[0]
         self.last_edge_usage: Optional[torch.Tensor] = None
+        self.last_rows: Optional[torch.Tensor] = None
+        self.last_cols: Optional[torch.Tensor] = None
+        self.last_vals: Optional[torch.Tensor] = None
         self.last_saturation = 0.0
 
     @property
@@ -216,34 +219,212 @@ class VariableBioDynamicFeatureHypergraph(nn.Module):
         vals = vals.reshape(-1)
         usage = torch.bincount(cols.detach(), minlength=n_edges).to(node_embeddings.device)
         self.last_edge_usage = usage
+        self.last_rows = rows.detach()
+        self.last_cols = cols.detach()
+        self.last_vals = vals.detach()
         self.last_saturation = float((usage > 0).float().mean().detach().cpu())
         return rows, cols, vals, n_edges
 
     @torch.no_grad()
-    def adjust_edges(self, beta=0.90, gamma=0.98, delta_edges=20, allow_add=True):
+    def adjust_edges(
+        self,
+        beta=0.90,
+        gamma=0.98,
+        delta_edges=20,
+        allow_add=True,
+        node_embeddings: Optional[torch.Tensor] = None,
+        raw_node_features: Optional[torch.Tensor] = None,
+        evolve_ratio: float = 0.05,
+    ):
+        """Adaptively compress or refine dynamic feature hyperedges.
+
+        Feature hyperedges are initialized from cells, so the initial prototype
+        count can be far larger than the biological feature patterns needed by
+        the model.  Instead of preserving that initial budget, this routine
+        estimates a compact target budget from active-edge saturation, then
+        moves toward it with a bounded per-step evolution ratio.  Redundant
+        high-usage prototypes are merged first; any remaining compression is
+        done by pruning low-importance prototypes.  Splitting is reserved for
+        the opposite case where the active set is saturated and additional
+        capacity is justified.
+        """
         device = self.edge_raw_features.device
         usage = self.last_edge_usage
         n_edges = self.n_edges
         if usage is None:
             return {"action": "skip", "saturation": 0.0, "empty": n_edges, "n_edges": n_edges}
+
         non_empty = int((usage > 0).sum().item())
         empty = n_edges - non_empty
         saturation = non_empty / max(n_edges, 1)
-        action = "keep"
-        if saturation < beta and n_edges > self.min_edges:
-            keep_count = max(self.min_edges, n_edges - delta_edges)
-            keep_idx = torch.argsort(usage, descending=True)[:keep_count].sort().values
-            self.edge_raw_features = nn.Parameter(self.edge_raw_features.data[keep_idx].clone().to(device))
-            action = "prune"
-        elif saturation > gamma and allow_add and n_edges < self.max_edges:
-            add_count = min(delta_edges, self.max_edges - n_edges)
-            source = torch.randint(0, n_edges, (add_count,), device=device)
-            scale = self.edge_raw_features.data.std(dim=0, keepdim=True).clamp_min(1e-3)
-            noise = 0.01 * torch.randn(add_count, self.raw_dim, device=device) * scale
-            added = self.edge_raw_features.data[source] + noise
-            self.edge_raw_features = nn.Parameter(torch.cat([self.edge_raw_features.data, added], dim=0))
-            action = "add"
-        return {"action": action, "saturation": saturation, "empty": empty, "n_edges": self.n_edges}
+        target_saturation = 0.85
+        target_edges = int(torch.ceil(torch.tensor(non_empty / target_saturation)).item()) if non_empty else self.min_edges
+        target_edges = max(self.min_edges, min(self.max_edges, target_edges))
+        max_ops = max(1, int(round(float(evolve_ratio) * n_edges)))
+
+        if node_embeddings is None or raw_node_features is None or self.last_cols is None:
+            action = "keep"
+            if n_edges > target_edges:
+                keep_count = max(target_edges, n_edges - max_ops)
+                keep_idx = torch.argsort(usage, descending=True)[:keep_count].sort().values
+                self.edge_raw_features = nn.Parameter(self.edge_raw_features.data[keep_idx].clone().to(device))
+                action = "adaptive_prune"
+            elif saturation > gamma and allow_add and n_edges < self.max_edges:
+                add_count = min(max_ops, self.max_edges - n_edges)
+                source = torch.randint(0, n_edges, (add_count,), device=device)
+                scale = self.edge_raw_features.data.std(dim=0, keepdim=True).clamp_min(1e-3)
+                noise = 0.01 * torch.randn(add_count, self.raw_dim, device=device) * scale
+                added = self.edge_raw_features.data[source] + noise
+                self.edge_raw_features = nn.Parameter(torch.cat([self.edge_raw_features.data, added], dim=0))
+                action = "add"
+            return {
+                "action": action, "saturation": saturation, "empty": empty,
+                "n_edges": self.n_edges, "n_edges_before": n_edges,
+                "target_edges": target_edges, "merged": 0, "pruned": max(0, n_edges - self.n_edges),
+                "split": 0, "evolve_ratio": float(evolve_ratio),
+            }
+
+        node_embeddings = node_embeddings.detach().to(device)
+        raw_node_features = raw_node_features.detach().to(device)
+        usage = usage.to(device)
+        cols = self.last_cols.to(device)
+        vals = self.last_vals.to(device) if self.last_vals is not None else torch.ones_like(cols, dtype=torch.float32)
+        rows = self.last_rows.to(device) if self.last_rows is not None else None
+
+        attention_mass = torch.zeros(n_edges, device=device)
+        attention_mass.scatter_add_(0, cols, vals.float())
+        importance = usage.float() + attention_mass / attention_mass.max().clamp_min(1e-8)
+
+        merge_pairs: List[Tuple[int, int]] = []
+        used_edges = set()
+        prune_edges = set()
+        split_edges: List[int] = []
+
+        if n_edges > target_edges:
+            target_after = max(target_edges, n_edges - max_ops)
+            remove_budget = min(n_edges - target_after, max(0, n_edges - self.min_edges))
+            if remove_budget > 0 and n_edges > 1:
+                proto = F.normalize(self.edge_raw_features.data, p=2, dim=1)
+                sim = proto @ proto.T
+                sim.fill_diagonal_(-float("inf"))
+                candidate_count = min(sim.numel(), remove_budget * 20 + n_edges)
+                flat_vals, flat_idx = torch.topk(sim.reshape(-1), k=candidate_count)
+                for score, flat in zip(flat_vals.tolist(), flat_idx.tolist()):
+                    if score == -float("inf"):
+                        break
+                    i = flat // n_edges
+                    j = flat % n_edges
+                    if i == j or i in used_edges or j in used_edges:
+                        continue
+                    if usage[i] <= 0 or usage[j] <= 0:
+                        continue
+                    merge_pairs.append((i, j))
+                    used_edges.add(i)
+                    used_edges.add(j)
+                    if len(merge_pairs) >= remove_budget:
+                        break
+
+            remaining_remove = max(0, remove_budget - len(merge_pairs))
+            if remaining_remove > 0:
+                candidate_scores = importance.clone()
+                for edge_idx in used_edges:
+                    candidate_scores[edge_idx] = float("inf")
+                # Prefer removing empty and low-importance prototypes, but never
+                # go below the current step's target_after budget.
+                removable = torch.isfinite(candidate_scores)
+                k_prune = min(remaining_remove, int(removable.sum().item()))
+                if k_prune > 0:
+                    prune_edges = set(torch.topk(-candidate_scores, k=k_prune).indices.tolist())
+
+        elif allow_add and saturation > gamma and n_edges < target_edges:
+            add_budget = min(target_edges - n_edges, max_ops, self.max_edges - n_edges)
+            if add_budget > 0 and rows is not None:
+                min_split_size = max(4, int(0.005 * node_embeddings.shape[0]))
+                heterogeneity = torch.full((n_edges,), -float("inf"), device=device)
+                usage_norm = usage.float() / usage.float().max().clamp_min(1.0)
+                for edge_idx in range(n_edges):
+                    if int(usage[edge_idx].item()) < min_split_size:
+                        continue
+                    node_idx = rows[cols == edge_idx]
+                    if node_idx.numel() < min_split_size:
+                        continue
+                    z = node_embeddings[node_idx]
+                    variance = ((z - z.mean(dim=0, keepdim=True)) ** 2).sum(dim=1).mean()
+                    heterogeneity[edge_idx] = usage_norm[edge_idx] * variance
+                valid = torch.isfinite(heterogeneity)
+                if valid.any():
+                    k_split = min(add_budget, int(valid.sum().item()))
+                    split_edges = torch.topk(heterogeneity, k=k_split).indices.tolist()
+
+        split_set = set(split_edges)
+        removed = set(used_edges) | prune_edges | split_set
+        new_edges: List[torch.Tensor] = []
+        for edge_idx in range(n_edges):
+            if edge_idx not in removed:
+                new_edges.append(self.edge_raw_features.data[edge_idx])
+
+        merged_count = 0
+        for i, j in merge_pairs:
+            wi = usage[i].float().clamp_min(1.0)
+            wj = usage[j].float().clamp_min(1.0)
+            merged = (wi * self.edge_raw_features.data[i] + wj * self.edge_raw_features.data[j]) / (wi + wj)
+            new_edges.append(merged)
+            merged_count += 1
+
+        split_count = 0
+        min_child_size = max(2, int(0.0025 * node_embeddings.shape[0]))
+        for edge_idx in split_edges:
+            node_idx = rows[cols == edge_idx]
+            if node_idx.numel() < 2 * min_child_size:
+                new_edges.append(self.edge_raw_features.data[edge_idx])
+                continue
+            z = node_embeddings[node_idx]
+            center = z.mean(dim=0, keepdim=True)
+            first = torch.argmax(((z - center) ** 2).sum(dim=1))
+            second = torch.argmax(((z - z[first:first + 1]) ** 2).sum(dim=1))
+            centers = torch.stack([z[first], z[second]], dim=0)
+            labels = None
+            for _ in range(5):
+                dist = torch.cdist(z, centers)
+                labels = torch.argmin(dist, dim=1)
+                for c in range(2):
+                    mask = labels == c
+                    if mask.any():
+                        centers[c] = z[mask].mean(dim=0)
+            if labels is None:
+                new_edges.append(self.edge_raw_features.data[edge_idx])
+                continue
+            child0 = node_idx[labels == 0]
+            child1 = node_idx[labels == 1]
+            if child0.numel() < min_child_size or child1.numel() < min_child_size:
+                new_edges.append(self.edge_raw_features.data[edge_idx])
+                continue
+            new_edges.append(raw_node_features[child0].mean(dim=0))
+            new_edges.append(raw_node_features[child1].mean(dim=0))
+            split_count += 1
+
+        if new_edges:
+            self.edge_raw_features = nn.Parameter(torch.stack(new_edges, dim=0).to(device))
+
+        pruned_count = len(prune_edges)
+        if merged_count or pruned_count:
+            action = "adaptive_compress"
+        elif split_count:
+            action = "adaptive_split"
+        else:
+            action = "keep"
+        return {
+            "action": action,
+            "saturation": saturation,
+            "empty": empty,
+            "n_edges": self.n_edges,
+            "n_edges_before": n_edges,
+            "target_edges": target_edges,
+            "merged": merged_count,
+            "pruned": pruned_count,
+            "split": split_count,
+            "evolve_ratio": float(evolve_ratio),
+        }
 
 
 # ====================================================================== #
@@ -355,12 +536,20 @@ class DualBranchDHGNN(nn.Module):
                 nn.Linear(hidden_dim, dim),
             ))
 
-    def adjust_dynamic_feature_edges(self, beta=0.90, gamma=0.98, delta_edges=20, allow_add=True):
+    def adjust_dynamic_feature_edges(
+        self, beta=0.90, gamma=0.98, delta_edges=20, allow_add=True,
+        modality_node_embeddings=None, raw_node_features=None, evolve_ratio=0.05,
+    ):
         if not self.use_dynamic_feature:
             return []
         logs = []
         for m, builder in enumerate(self.dynamic_feature_builders):
-            log = builder.adjust_edges(beta=beta, gamma=gamma, delta_edges=delta_edges, allow_add=allow_add)
+            node_h = modality_node_embeddings[m] if modality_node_embeddings is not None else None
+            raw_x = raw_node_features[m] if raw_node_features is not None else None
+            log = builder.adjust_edges(
+                beta=beta, gamma=gamma, delta_edges=delta_edges, allow_add=allow_add,
+                node_embeddings=node_h, raw_node_features=raw_x, evolve_ratio=evolve_ratio,
+            )
             log["modality"] = m
             logs.append(log)
         return logs
@@ -503,11 +692,24 @@ def smoothness_loss_sparse(x, rows, cols, vals, n_nodes, n_edges):
     return F.mse_loss(x, x_recon)
 
 
+def incidence_balance_loss(cols, vals, n_edges):
+    """Encourage dynamic feature-hyperedge assignments to avoid collapse.
+
+    The loss is zero when attention mass is uniformly distributed over all
+    available hyperedges and grows as mass concentrates on a small subset.
+    """
+    mass = torch.zeros(n_edges, device=vals.device)
+    mass.scatter_add_(0, cols, vals.float())
+    prob = mass / mass.sum().clamp_min(1e-8)
+    return n_edges * torch.sum(prob ** 2) - 1.0
+
+
 def compute_total_loss(
     outputs, sp_rows, sp_cols, sp_vals,
     n_nodes, n_spatial_edges, input_dims,
     lambda_cluster=1.0, lambda_smooth=0.1,
     lambda_recon=0.5, lambda_contrast=0.0,
+    lambda_balance=0.01,
     dec_phase=True, temperature=0.5,
 ):
     embedding = outputs["embedding"]
@@ -541,21 +743,25 @@ def compute_total_loss(
         embedding, sp_rows, sp_cols, sp_vals, n_nodes, n_spatial_edges
     )
 
-    # Smoothness on each modality's feature hypergraph
+    # Smoothness and load balance on each modality's feature hypergraph
     sm_feat_total = torch.tensor(0.0, device=embedding.device)
+    balance_total = torch.tensor(0.0, device=embedding.device)
     for ft_rows, ft_cols, ft_vals, n_feat_edges in outputs["feat_tensors"]:
         sm_feat_total = sm_feat_total + smoothness_loss_sparse(
             embedding, ft_rows, ft_cols, ft_vals, n_nodes, n_feat_edges
         )
+        balance_total = balance_total + incidence_balance_loss(ft_cols, ft_vals, n_feat_edges)
 
     total = (
         lambda_recon * recon_loss
         + lambda_cluster * clust_loss
         + lambda_smooth * (sm_spatial + sm_feat_total)
+        + lambda_balance * balance_total
     )
     loss_dict = {
         "total": total.item(), "recon": recon_loss.item(),
         "contrast": contrast_loss.item(), "cluster": clust_loss.item(),
         "smooth_s": sm_spatial.item(), "smooth_f": sm_feat_total.item(),
+        "balance": balance_total.item(),
     }
     return total, loss_dict

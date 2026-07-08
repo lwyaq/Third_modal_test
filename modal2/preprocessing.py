@@ -44,9 +44,9 @@ def clustering(
     n_clusters: int = 7,
     method: str = "mclust",
     random_state: int = 42,
-) -> None:
+) -> np.ndarray:
     """
-    Perform clustering on embeddings.
+    Perform clustering on embeddings and return integer labels.
 
     Priority: mclust (R) → GaussianMixture (Python) → KMeans
     """
@@ -85,6 +85,7 @@ def clustering(
 
                 best_bic = np.inf
                 best_labels = None
+                best_cov_type = None
                 for cov_type in ["full", "tied", "diag"]:
                     gm = GaussianMixture(
                         n_components=n_clusters,
@@ -97,8 +98,9 @@ def clustering(
                     if gm.bic(embedding) < best_bic:
                         best_bic = gm.bic(embedding)
                         best_labels = gm.predict(embedding)
+                        best_cov_type = cov_type
                 labels = best_labels
-                print(f"  GaussianMixture best covariance: {cov_type}, BIC: {best_bic:.2f}")
+                print(f"  GaussianMixture best covariance: {best_cov_type}, BIC: {best_bic:.2f}")
             except Exception as e2:
                 print(f"GaussianMixture failed ({e2}), using KMeans")
 
@@ -110,6 +112,7 @@ def clustering(
         ).fit_predict(embedding)
 
     adata.obs[add_key] = pd.Categorical(labels.astype(str))
+    return labels
 
 
 def extract_coords(adata: sc.AnnData) -> np.ndarray:
