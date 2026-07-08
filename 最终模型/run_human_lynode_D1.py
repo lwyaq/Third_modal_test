@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 import warnings
 from typing import Dict
 
@@ -48,6 +49,7 @@ def parse_args():
     p.add_argument("--rna_file", type=str, default="adata_RNA.h5ad")
     p.add_argument("--prot_file", type=str, default="adata_ADT.h5ad")
     p.add_argument("--n_classes", type=int, default=11)
+    p.add_argument("--dataset_name", type=str, default="human_lynode_D1")
     p.add_argument("--output_dir", type=str, default="results/human_lynode_D1")
 
     # ============================================================
@@ -150,6 +152,7 @@ def print_unsupervised_metrics(metrics: Dict[str, float], title: str):
 
 
 def main():
+    total_start = time.perf_counter()
     args = parse_args()
     setup_seed(args.seed)
 
@@ -164,11 +167,13 @@ def main():
     print("=" * 70)
     print(f"Device: {device}")
     print(f"Seed: {args.seed}")
+    print(f"Dataset name: {args.dataset_name}")
     print(f"Output directory: {args.output_dir}")
 
     # ============================================================
     # Load data
     # ============================================================
+    load_start = time.perf_counter()
     rna_path = os.path.join(args.data_dir, args.rna_file)
     prot_path = os.path.join(args.data_dir, args.prot_file)
 
@@ -197,10 +202,12 @@ def main():
 
     assert np.array_equal(adata_rna.obs_names, adata_prot.obs_names), \
         "RNA and Protein obs_names are not aligned!"
+    load_time = time.perf_counter() - load_start
 
     # ============================================================
     # Preprocessing: RNA
     # ============================================================
+    preprocess_start = time.perf_counter()
     print("\nPreprocessing RNA...")
 
     sc.pp.filter_genes(adata_rna, min_cells=10)
@@ -244,6 +251,7 @@ def main():
     labels = None
     n_classes = args.n_classes
     print(f"\nNo ground-truth labels are used; unsupervised mode (n_classes={n_classes}).")
+    preprocess_time = time.perf_counter() - preprocess_start
 
     # ============================================================
     # Print data summary
@@ -294,6 +302,7 @@ def main():
     # ============================================================
     modality_data = [rna_features, prot_features]
 
+    train_start = time.perf_counter()
     trainer = DHGNNTrainer(
         coords=coords,
         modality_data=modality_data,
@@ -344,10 +353,12 @@ def main():
 
     trainer.fit()
     embedding = trainer.get_embedding()
+    train_time = time.perf_counter() - train_start
 
     # ============================================================
     # Final KMeans and mclust clustering on the learned embedding
     # ============================================================
+    clustering_start = time.perf_counter()
     adata = anndata.AnnData(obs=adata_rna.obs.copy())
     adata.obsm["DvDHGNN"] = embedding
     adata.obsm["spatial"] = coords
@@ -377,41 +388,80 @@ def main():
 
     print_unsupervised_metrics(kmeans_metrics, "DvDHGNN Human Lymph Node D1 (KMeans)")
     print_unsupervised_metrics(mclust_metrics, "DvDHGNN Human Lymph Node D1 (mclust)")
+    clustering_eval_time = time.perf_counter() - clustering_start
 
     # ============================================================
     # Save outputs
     # ============================================================
-    cluster_path = os.path.join(args.output_dir, "clusters.csv")
-    metrics_path = os.path.join(args.output_dir, "unsupervised_metrics.csv")
-    embedding_path = os.path.join(args.output_dir, "embedding.npy")
-    adata_path = os.path.join(args.output_dir, "dvdhgnn_human_lynode_D1_results.h5ad")
+    save_start = time.perf_counter()
+    adata_path = os.path.join(args.output_dir, f"{args.dataset_name}_results.h5ad")
+    performance_path = os.path.join(args.output_dir, f"{args.dataset_name}_performance.csv")
 
-    cluster_df = pd.DataFrame(
-        {
-            "obs_name": adata.obs_names,
-            "DvDHGNN_kmeans": kmeans_labels.astype(int),
-            "DvDHGNN_mclust": mclust_labels.astype(int),
-        }
-    )
-    cluster_df.to_csv(cluster_path, index=False)
+    adata.obs["DvDHGNN_kmeans"] = pd.Categorical(kmeans_labels.astype(str))
+    adata.obs["DvDHGNN_mclust"] = pd.Categorical(mclust_labels.astype(str))
+    adata.uns["dataset_name"] = args.dataset_name
+    adata.uns["n_classes"] = n_classes
+    adata.uns["unsupervised_metrics"] = {
+        "kmeans": kmeans_metrics,
+        "mclust": mclust_metrics,
+    }
+    adata.write_h5ad(adata_path)
 
-    metrics_df = pd.DataFrame(
+    save_time = time.perf_counter() - save_start
+    total_time = time.perf_counter() - total_start
+
+    n_nodes = int(coords.shape[0])
+    n_modalities = len(modality_data)
+    input_dim_total = int(sum(feats.shape[1] for feats in modality_data))
+    n_spatial_edges = int(getattr(trainer, "n_spatial_edges", 0))
+
+    performance_df = pd.DataFrame(
         [
-            {"method": "kmeans", **kmeans_metrics},
-            {"method": "mclust", **mclust_metrics},
+            {
+                "dataset": args.dataset_name,
+                "n_nodes": n_nodes,
+                "n_modalities": n_modalities,
+                "rna_pca_dim": int(rna_features.shape[1]),
+                "prot_pca_dim": int(prot_features.shape[1]),
+                "input_dim_total": input_dim_total,
+                "hidden_dim": args.hidden_dim,
+                "n_layers": args.n_layers,
+                "n_classes": n_classes,
+                "n_spatial_edges": n_spatial_edges,
+                "epochs_configured": args.epochs,
+                "device": str(device),
+                "load_time_sec": load_time,
+                "preprocess_time_sec": preprocess_time,
+                "train_time_sec": train_time,
+                "clustering_eval_time_sec": clustering_eval_time,
+                "save_time_sec": save_time,
+                "total_time_sec": total_time,
+                "time_complexity": (
+                    "O(N log N + T * L * M * (nnz(H_spatial) + nnz(H_feature)) * H)"
+                ),
+                "space_complexity": (
+                    "O(N * (D + H) + nnz(H_spatial) + nnz(H_feature) + P)"
+                ),
+                "complexity_symbols": (
+                    "N=spots/cells, T=training epochs, L=HGNN layers, "
+                    "M=modalities, H=hidden_dim, D=sum input PCA dims, "
+                    "P=model parameters"
+                ),
+                "kmeans_morans_i": kmeans_metrics["morans_i"],
+                "kmeans_silhouette": kmeans_metrics["silhouette"],
+                "kmeans_dbi": kmeans_metrics["dbi"],
+                "mclust_morans_i": mclust_metrics["morans_i"],
+                "mclust_silhouette": mclust_metrics["silhouette"],
+                "mclust_dbi": mclust_metrics["dbi"],
+            }
         ]
     )
-    metrics_df.to_csv(metrics_path, index=False)
-
-    np.save(embedding_path, embedding)
-    adata.write_h5ad(adata_path)
+    performance_df.to_csv(performance_path, index=False)
 
     print("\nSaved outputs")
     print("-" * 70)
-    print(f"Clusters:  {cluster_path}")
-    print(f"Metrics:   {metrics_path}")
-    print(f"Embedding: {embedding_path}")
-    print(f"AnnData:   {adata_path}")
+    print(f"AnnData result file: {adata_path}")
+    print(f"Performance CSV:     {performance_path}")
 
 
 if __name__ == "__main__":
