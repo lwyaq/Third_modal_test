@@ -191,6 +191,9 @@ def main():
     if labels is not None:
         predictions = trainer.get_predictions()
         final_metrics = evaluate_clustering(labels, predictions)
+        for k, v in metrics.items():
+            if k.startswith("final_kmeans_"):
+                final_metrics[k] = v
         print_metrics(final_metrics, title="DvDHGNN Clustering (All Cells)")
 
 

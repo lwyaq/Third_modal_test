@@ -419,10 +419,24 @@ class DHGNNTrainer:
         model.eval()
         with torch.no_grad():
             metrics = self._evaluate(model, modality_tensors, cluster_method=self.clustering_method)
+            if self.clustering_method != "kmeans":
+                kmeans_metrics = self._evaluate(model, modality_tensors, cluster_method="kmeans")
+                for key in ("ari", "nmi", "ami", "silhouette", "morans_i_cluster"):
+                    if key in kmeans_metrics:
+                        metrics[f"final_kmeans_{key}"] = kmeans_metrics[key]
 
         print(f"\nBest loss: {best_loss:.4f} at epoch {best_epoch+1}")
         if "ari" in metrics:
-            print(f"Final: ARI={metrics['ari']:.4f}, NMI={metrics['nmi']:.4f}")
+            print(
+                f"Final ({self.clustering_method}): "
+                f"ARI={metrics['ari']:.4f}, NMI={metrics['nmi']:.4f}"
+            )
+            if "final_kmeans_ari" in metrics:
+                print(
+                    f"Final reference (kmeans): "
+                    f"ARI={metrics['final_kmeans_ari']:.4f}, "
+                    f"NMI={metrics['final_kmeans_nmi']:.4f}"
+                )
             metrics["best_observed_ari"] = best_observed_ari
             metrics["best_observed_nmi"] = best_observed_nmi
             metrics["best_observed_epoch"] = best_observed_epoch + 1

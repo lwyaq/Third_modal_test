@@ -198,6 +198,9 @@ def main():
         for k in ("morans_i_cluster", "morans_i_embedding_mean"):
             if k in metrics:
                 final_metrics[k] = metrics[k]
+        for k, v in metrics.items():
+            if k.startswith("final_kmeans_"):
+                final_metrics[k] = v
         print_metrics(final_metrics, title="DvDHGNN Human Lymph Node (RNA + Protein)")
     else:
         print("\n" + "=" * 50)
